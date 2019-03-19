@@ -699,6 +699,11 @@ void store_host_key(const char *hostname, int port,
 
     fclose(wfp);
 
+    if (unlink(filename) != 0 && errno != ENOENT) {
+        nonfatal("Unable to delete old host key file: unlink(\"%s\")"
+                 " returned '%s'", filename, strerror(errno));
+    }
+
     if (rename(tmpfilename, filename) < 0) {
         nonfatal("Unable to store host key: rename(\"%s\",\"%s\")"
                  " returned '%s'", tmpfilename, filename,
