@@ -46,35 +46,35 @@ static void make_session_filename(const char *in, strbuf *out)
          * opt-in for safe characters rather than opt-out for
          * specific unsafe ones...
          */
-	if (*in!='+' && *in!='-' && *in!='.' && *in!='@' && *in!='_' &&
+        if (*in!='+' && *in!='-' && *in!='.' && *in!='@' && *in!='_' &&
             !(*in >= '0' && *in <= '9') &&
             !(*in >= 'A' && *in <= 'Z') &&
             !(*in >= 'a' && *in <= 'z')) {
-	    put_byte(out, '%');
-	    put_byte(out, hex[((unsigned char) *in) >> 4]);
-	    put_byte(out, hex[((unsigned char) *in) & 15]);
-	} else
-	    put_byte(out, *in);
-	in++;
+            put_byte(out, '%');
+            put_byte(out, hex[((unsigned char) *in) >> 4]);
+            put_byte(out, hex[((unsigned char) *in) & 15]);
+        } else
+            put_byte(out, *in);
+        in++;
     }
 }
 
 static void decode_session_filename(const char *in, strbuf *out)
 {
     while (*in) {
-	if (*in == '%' && in[1] && in[2]) {
-	    int i, j;
+        if (*in == '%' && in[1] && in[2]) {
+            int i, j;
 
-	    i = in[1] - '0';
-	    i -= (i > 9 ? 7 : 0);
-	    j = in[2] - '0';
-	    j -= (j > 9 ? 7 : 0);
+            i = in[1] - '0';
+            i -= (i > 9 ? 7 : 0);
+            j = in[2] - '0';
+            j -= (j > 9 ? 7 : 0);
 
-	    put_byte(out, (i << 4) + j);
-	    in += 3;
-	} else {
-	    put_byte(out, *in++);
-	}
+            put_byte(out, (i << 4) + j);
+            in += 3;
+        } else {
+            put_byte(out, *in++);
+        }
     }
 }
 
@@ -88,52 +88,52 @@ static char *make_filename(int index, const char *subname)
      * specific subparts of it, by means of environment variables.
      */
     if (index == INDEX_DIR) {
-	env = getenv("PUTTYDIR");
-	if (env)
-	    return dupstr(env);
-	GetCurrentDirectory(FNLEN, buf);
+        env = getenv("PUTTYDIR");
+        if (env)
+            return dupstr(env);
+        GetCurrentDirectory(FNLEN, buf);
         return dupstr(buf);
     }
     if (index == INDEX_SESSIONDIR) {
-	env = getenv("PUTTYSESSIONS");
-	if (env)
-	    return dupstr(env);
-	tmp = make_filename(INDEX_DIR, NULL);
-	ret = dupprintf("%s/sessions", tmp);
-	sfree(tmp);
-	return ret;
+        env = getenv("PUTTYSESSIONS");
+        if (env)
+            return dupstr(env);
+        tmp = make_filename(INDEX_DIR, NULL);
+        ret = dupprintf("%s/sessions", tmp);
+        sfree(tmp);
+        return ret;
     }
     if (index == INDEX_SESSION) {
         strbuf *sb = strbuf_new();
-	tmp = make_filename(INDEX_SESSIONDIR, NULL);
-	strbuf_catf(sb, "%s/", tmp);
-	sfree(tmp);
+        tmp = make_filename(INDEX_SESSIONDIR, NULL);
+        strbuf_catf(sb, "%s/", tmp);
+        sfree(tmp);
         make_session_filename(subname, sb);
         return strbuf_to_str(sb);
     }
     if (index == INDEX_HOSTKEYS) {
-	env = getenv("PUTTYSSHHOSTKEYS");
-	if (env)
-	    return dupstr(env);
-	tmp = make_filename(INDEX_DIR, NULL);
-	ret = dupprintf("%s/sshhostkeys", tmp);
-	sfree(tmp);
-	return ret;
+        env = getenv("PUTTYSSHHOSTKEYS");
+        if (env)
+            return dupstr(env);
+        tmp = make_filename(INDEX_DIR, NULL);
+        ret = dupprintf("%s/sshhostkeys", tmp);
+        sfree(tmp);
+        return ret;
     }
     if (index == INDEX_HOSTKEYS_TMP) {
-	tmp = make_filename(INDEX_HOSTKEYS, NULL);
-	ret = dupprintf("%s.tmp", tmp);
-	sfree(tmp);
-	return ret;
+        tmp = make_filename(INDEX_HOSTKEYS, NULL);
+        ret = dupprintf("%s.tmp", tmp);
+        sfree(tmp);
+        return ret;
     }
     if (index == INDEX_RANDSEED) {
-	env = getenv("PUTTYRANDOMSEED");
-	if (env)
-	    return dupstr(env);
-	tmp = make_filename(INDEX_DIR, NULL);
-	ret = dupprintf("%s/randomseed", tmp);
-	sfree(tmp);
-	return ret;
+        env = getenv("PUTTYRANDOMSEED");
+        if (env)
+            return dupstr(env);
+        tmp = make_filename(INDEX_DIR, NULL);
+        ret = dupprintf("%s/randomseed", tmp);
+        sfree(tmp);
+        return ret;
     }
     tmp = make_filename(INDEX_DIR, NULL);
     ret = dupprintf("%s/ERROR", tmp);
@@ -206,8 +206,8 @@ settings_w *open_settings_w(const char *sessionname, char **errmsg)
     if (!fp) {
         *errmsg = dupprintf("Unable to save session: open(\"%s\") "
                             "returned '%s'", filename, strerror(errno));
-	sfree(filename);
-	return NULL;                   /* can't open */
+        sfree(filename);
+        return NULL;                   /* can't open */
     }
     sfree(filename);
 
@@ -268,30 +268,30 @@ void provide_xrm_string(char *string)
 
     p = q = strchr(string, ':');
     if (!q) {
-	fprintf(stderr, "pterm: expected a colon in resource string"
-		" \"%s\"\n", string);
-	return;
+        fprintf(stderr, "pterm: expected a colon in resource string"
+                " \"%s\"\n", string);
+        return;
     }
     q++;
     while (p > string && p[-1] != '.' && p[-1] != '*')
-	p--;
+        p--;
     xrms = snew(struct skeyval);
     key = snewn(q-p, char);
     memcpy(key, p, q-p);
     key[q-p-1] = '\0';
     xrms->key = key;
     while (*q && isspace((unsigned char)*q))
-	q++;
+        q++;
     xrms->value = dupstr(q);
 
     if (!xrmtree)
-	xrmtree = newtree234(keycmp);
+        xrmtree = newtree234(keycmp);
 
     ret = add234(xrmtree, xrms);
     if (ret) {
-	/* Override an existing string. */
-	del234(xrmtree, ret);
-	add234(xrmtree, xrms);
+        /* Override an existing string. */
+        del234(xrmtree, ret);
+        add234(xrmtree, xrms);
     }
 }
 
@@ -300,9 +300,9 @@ static const char *get_setting(const char *key)
     struct skeyval tmp, *ret;
     tmp.key = key;
     if (xrmtree) {
-	ret = find234(xrmtree, &tmp, NULL);
-	if (ret)
-	    return ret->value;
+        ret = find234(xrmtree, &tmp, NULL);
+        if (ret)
+            return ret->value;
     }
     return NULL;
 }
@@ -327,7 +327,7 @@ settings_r *open_settings_r(const char *sessionname)
     fp = fopen(filename, "r");
     sfree(filename);
     if (!fp)
-	return NULL;		       /* can't open */
+        return NULL;                       /* can't open */
 
     toret = snew(settings_r);
     toret->t = newtree234(keycmp);
@@ -370,9 +370,9 @@ char *read_setting_s(settings_r *handle, const char *key)
         val = get_setting(key);
 
     if (!val)
-	return NULL;
+        return NULL;
     else
-	return dupstr(val);
+        return dupstr(val);
 }
 
 int read_setting_i(settings_r *handle, const char *key, int defvalue)
@@ -389,9 +389,9 @@ int read_setting_i(settings_r *handle, const char *key, int defvalue)
         val = get_setting(key);
 
     if (!val)
-	return defvalue;
+        return defvalue;
     else
-	return atoi(val);
+        return atoi(val);
 }
 
 FontSpec *read_setting_fontspec(settings_r *handle, const char *name)
@@ -403,7 +403,7 @@ FontSpec *read_setting_fontspec(settings_r *handle, const char *name)
 
     fontname = read_setting_s(handle, name);
     if (!fontname)
-	return NULL;
+        return NULL;
 
     settingname = dupcat(name, "IsBold", NULL);
     isbold = read_setting_i(handle, settingname, -1);
@@ -439,10 +439,10 @@ Filename *read_setting_filename(settings_r *handle, const char *name)
     char *tmp = read_setting_s(handle, name);
     if (tmp) {
         Filename *ret = filename_from_str(tmp);
-	sfree(tmp);
-	return ret;
+        sfree(tmp);
+        return ret;
     } else
-	return NULL;
+        return NULL;
 }
 
 void write_setting_fontspec(settings_w *handle, const char *name, FontSpec *font)
@@ -530,13 +530,13 @@ bool enum_settings_next(settings_e *handle, strbuf *out)
 
     while ( (de = readdir(handle->dp)) != NULL ) {
         fullpath->len = baselen;
-	put_datapl(fullpath, ptrlen_from_asciz(de->d_name));
+        put_datapl(fullpath, ptrlen_from_asciz(de->d_name));
 
         if (stat(fullpath->s, &st) < 0 || !S_ISREG(st.st_mode))
             continue;                  /* try another one */
 
         decode_session_filename(de->d_name, out);
-	strbuf_free(fullpath);
+        strbuf_free(fullpath);
         return true;
     }
 
@@ -561,7 +561,7 @@ void enum_settings_finish(settings_e *handle)
  *   rsa@22:foovax.example.org 0x23,0x293487364395345345....2343
  */
 int verify_host_key(const char *hostname, int port,
-		    const char *keytype, const char *key)
+                    const char *keytype, const char *key)
 {
     FILE *fp;
     char *filename;
@@ -572,57 +572,57 @@ int verify_host_key(const char *hostname, int port,
     fp = fopen(filename, "r");
     sfree(filename);
     if (!fp)
-	return 1;		       /* key does not exist */
+        return 1;                       /* key does not exist */
 
     ret = 1;
     while ( (line = fgetline(fp)) ) {
-	int i;
-	char *p = line;
-	char porttext[20];
+        int i;
+        char *p = line;
+        char porttext[20];
 
-	line[strcspn(line, "\n")] = '\0';   /* strip trailing newline */
+        line[strcspn(line, "\n")] = '\0';   /* strip trailing newline */
 
-	i = strlen(keytype);
-	if (strncmp(p, keytype, i))
-	    goto done;
-	p += i;
+        i = strlen(keytype);
+        if (strncmp(p, keytype, i))
+            goto done;
+        p += i;
 
-	if (*p != '@')
-	    goto done;
-	p++;
+        if (*p != '@')
+            goto done;
+        p++;
 
-	sprintf(porttext, "%d", port);
-	i = strlen(porttext);
-	if (strncmp(p, porttext, i))
-	    goto done;
-	p += i;
+        sprintf(porttext, "%d", port);
+        i = strlen(porttext);
+        if (strncmp(p, porttext, i))
+            goto done;
+        p += i;
 
-	if (*p != ':')
-	    goto done;
-	p++;
+        if (*p != ':')
+            goto done;
+        p++;
 
-	i = strlen(hostname);
-	if (strncmp(p, hostname, i))
-	    goto done;
-	p += i;
+        i = strlen(hostname);
+        if (strncmp(p, hostname, i))
+            goto done;
+        p += i;
 
-	if (*p != ' ')
-	    goto done;
-	p++;
+        if (*p != ' ')
+            goto done;
+        p++;
 
-	/*
-	 * Found the key. Now just work out whether it's the right
-	 * one or not.
-	 */
-	if (!strcmp(p, key))
-	    ret = 0;		       /* key matched OK */
-	else
-	    ret = 2;		       /* key mismatch */
+        /*
+         * Found the key. Now just work out whether it's the right
+         * one or not.
+         */
+        if (!strcmp(p, key))
+            ret = 0;                       /* key matched OK */
+        else
+            ret = 2;                       /* key mismatch */
 
-	done:
-	sfree(line);
-	if (ret != 1)
-	    break;
+        done:
+        sfree(line);
+        if (ret != 1)
+            break;
     }
 
     fclose(fp);
@@ -640,7 +640,7 @@ bool have_ssh_host_key(const char *hostname, int port,
 }
 
 void store_host_key(const char *hostname, int port,
-		    const char *keytype, const char *key)
+                    const char *keytype, const char *key)
 {
     FILE *rfp, *wfp;
     char *newtext, *line;
@@ -663,7 +663,7 @@ void store_host_key(const char *hostname, int port,
             sfree(tmpfilename);
             return;
         }
-	sfree(dir);
+        sfree(dir);
 
         wfp = fopen(tmpfilename, "w");
     }
@@ -724,11 +724,11 @@ void read_random_seed(noise_consumer_t consumer)
     fd = open(fname, O_RDONLY);
     sfree(fname);
     if (fd >= 0) {
-	char buf[512];
-	int ret;
-	while ( (ret = read(fd, buf, sizeof(buf))) > 0)
-	    consumer(buf, ret);
-	close(fd);
+        char buf[512];
+        int ret;
+        while ( (ret = read(fd, buf, sizeof(buf))) > 0)
+            consumer(buf, ret);
+        close(fd);
     }
 }
 
@@ -753,7 +753,7 @@ void write_random_seed(void *data, int len)
         }
         char *dir, *errmsg;
 
-	dir = make_filename(INDEX_DIR, NULL);
+        dir = make_filename(INDEX_DIR, NULL);
         if ((errmsg = make_dir_path(dir)) != NULL) {
             nonfatal("Unable to write random seed: %s", errmsg);
             sfree(errmsg);
@@ -761,9 +761,9 @@ void write_random_seed(void *data, int len)
             sfree(dir);
             return;
         }
-	sfree(dir);
+        sfree(dir);
 
-	fd = open(fname, O_CREAT | O_WRONLY, 0600);
+        fd = open(fname, O_CREAT | O_WRONLY, 0600);
         if (fd < 0) {
             nonfatal("Unable to write random seed: open(\"%s\") "
                      "returned '%s'", fname, strerror(errno));
@@ -773,14 +773,14 @@ void write_random_seed(void *data, int len)
     }
 
     while (len > 0) {
-	int ret = write(fd, data, len);
-	if (ret < 0) {
+        int ret = write(fd, data, len);
+        if (ret < 0) {
             nonfatal("Unable to write random seed: write "
                      "returned '%s'", strerror(errno));
             break;
         }
-	len -= ret;
-	data = (char *)data + len;
+        len -= ret;
+        data = (char *)data + len;
     }
 
     close(fd);
