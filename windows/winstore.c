@@ -434,17 +434,6 @@ FontSpec *read_setting_fontspec(settings_r *handle, const char *name)
     return ret;
 }
 
-Filename *read_setting_filename(settings_r *handle, const char *name)
-{
-    char *tmp = read_setting_s(handle, name);
-    if (tmp) {
-        Filename *ret = filename_from_str(tmp);
-        sfree(tmp);
-        return ret;
-    } else
-        return NULL;
-}
-
 void write_setting_fontspec(settings_w *handle, const char *name, FontSpec *font)
 {
     char *settingname;
@@ -460,6 +449,18 @@ void write_setting_fontspec(settings_w *handle, const char *name, FontSpec *font
     write_setting_i(handle, settingname, font->height);
     sfree(settingname);
 }
+
+Filename *read_setting_filename(settings_r *handle, const char *name)
+{
+    char *tmp = read_setting_s(handle, name);
+    if (tmp) {
+        Filename *ret = filename_from_str(tmp);
+        sfree(tmp);
+        return ret;
+    } else
+        return NULL;
+}
+
 void write_setting_filename(settings_w *handle,
                             const char *name, Filename *result)
 {
