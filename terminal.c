@@ -2735,6 +2735,24 @@ static void toggle_mode(Terminal *term, int mode, int query, bool state)
     }
 }
 
+static void base64_to_clipboard(const char *data)
+{
+    size_t datalen = strlen(data);
+    if (datalen % 4 != 0)
+        return;
+    strbuf *buf = strbuf_new();
+    for (int j = 0; j < datalen; j += 4) {
+        unsigned char decoded[3];
+        int k = base64_decode_atom(data + j, decoded);
+        if (!k) {
+            return;
+        }
+        memcpy(strbuf_append(buf, k), decoded, k);
+    }
+    char *string = strbuf_to_str(buf);
+    write_aclip(CLIP_SYSTEM, string, strlen(string), false);
+}
+
 /*
  * Process an OSC sequence: set window title or icon name.
  */
@@ -2776,6 +2794,15 @@ static void do_osc(Terminal *term)
                 }
             }
             break;
+          case 52: {
+            const char *ptr = strchr(term->osc_string, ';');
+            if (!ptr)
+                break;
+            ptr++;
+            if (!*ptr)
+                break;
+            base64_to_clipboard(ptr);
+          }
         }
     }
 }
