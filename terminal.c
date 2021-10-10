@@ -2741,7 +2741,7 @@ static void base64_to_clipboard(const char *data)
     if (datalen % 4 != 0)
         return;
     strbuf *buf = strbuf_new();
-    for (int j = 0; j < datalen; j += 4) {
+    for (size_t j = 0; j < datalen; j += 4) {
         unsigned char decoded[3];
         int k = base64_decode_atom(data + j, decoded);
         if (!k) {
@@ -2750,7 +2750,7 @@ static void base64_to_clipboard(const char *data)
         memcpy(strbuf_append(buf, k), decoded, k);
     }
     char *string = strbuf_to_str(buf);
-    write_aclip(CLIP_SYSTEM, string, strlen(string), false);
+    write_aclip(CLIP_SYSTEM, string, buf->len, false);
 }
 
 /*
