@@ -405,7 +405,7 @@ FontSpec *read_setting_fontspec(settings_r *handle, const char *name)
     if (!fontname)
         return NULL;
 
-    settingname = dupcat(name, "IsBold", NULL);
+    settingname = dupcat(name, "IsBold");
     isbold = read_setting_i(handle, settingname, -1);
     sfree(settingname);
     if (isbold == -1) {
@@ -413,7 +413,7 @@ FontSpec *read_setting_fontspec(settings_r *handle, const char *name)
         return NULL;
     }
 
-    settingname = dupcat(name, "CharSet", NULL);
+    settingname = dupcat(name, "CharSet");
     charset = read_setting_i(handle, settingname, -1);
     sfree(settingname);
     if (charset == -1) {
@@ -421,7 +421,7 @@ FontSpec *read_setting_fontspec(settings_r *handle, const char *name)
         return NULL;
     }
 
-    settingname = dupcat(name, "Height", NULL);
+    settingname = dupcat(name, "Height");
     height = read_setting_i(handle, settingname, INT_MIN);
     sfree(settingname);
     if (height == INT_MIN) {
@@ -439,13 +439,13 @@ void write_setting_fontspec(settings_w *handle, const char *name, FontSpec *font
     char *settingname;
 
     write_setting_s(handle, name, font->name);
-    settingname = dupcat(name, "IsBold", NULL);
+    settingname = dupcat(name, "IsBold");
     write_setting_i(handle, settingname, font->isbold);
     sfree(settingname);
-    settingname = dupcat(name, "CharSet", NULL);
+    settingname = dupcat(name, "CharSet");
     write_setting_i(handle, settingname, font->charset);
     sfree(settingname);
-    settingname = dupcat(name, "Height", NULL);
+    settingname = dupcat(name, "Height");
     write_setting_i(handle, settingname, font->height);
     sfree(settingname);
 }
