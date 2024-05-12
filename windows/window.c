@@ -1,6 +1,6 @@
 /*
- * window.c - the PuTTY(tel) main program, which runs a PuTTY terminal
- * emulator and backend in a window.
+ * window.c - the PuTTY(tel)/pterm main program, which runs a PuTTY
+ * terminal emulator and backend in a window.
  */
 
 #include <stdio.h>
@@ -9,24 +9,20 @@
 #include <time.h>
 #include <limits.h>
 #include <assert.h>
+#include <wchar.h>
 
-#ifdef __WINE__
-#define NO_MULTIMON                    /* winelib doesn't have this */
-#endif
-
-#ifndef NO_MULTIMON
 #define COMPILE_MULTIMON_STUBS
-#endif
 
 #include "putty.h"
+#include "ssh.h"
 #include "terminal.h"
 #include "storage.h"
-#include "win_res.h"
-#include "winsecur.h"
-#include "winseat.h"
+#include "putty-rc.h"
+#include "security-api.h"
+#include "win-gui-seat.h"
 #include "tree234.h"
 
-#ifndef NO_MULTIMON
+#ifdef NO_MULTIMON
 #include <multimon.h>
 #endif
 
@@ -78,6 +74,9 @@
 #ifndef WM_MOUSEWHEEL
 #define WM_MOUSEWHEEL 0x020A           /* not defined in earlier SDKs */
 #endif
+#ifndef WM_MOUSEHWHEEL
+#define WM_MOUSEHWHEEL 0x020E          /* not defined in earlier SDKs */
+#endif
 #ifndef WHEEL_DELTA
 #define WHEEL_DELTA 120
 #endif
@@ -127,7 +126,7 @@ static int prev_rows, prev_cols;
 
 static void flash_window(int mode);
 static void sys_cursor_update(void);
-static bool get_fullscreen_rect(RECT * ss);
+static bool get_fullscreen_rect(RECT *ss);
 
 static int caret_x = -1, caret_y = -1;
 
@@ -135,6 +134,8 @@ static int kbd_codepage;
 
 static Ldisc *ldisc;
 static Backend *backend;
+
+static cmdline_get_passwd_input_state cmdline_get_passwd_state;
 
 static struct unicode_data ucsdata;
 static bool session_closed;
@@ -156,12 +157,6 @@ static HMENU savedsess_menu;
 static Conf *conf;
 static LogContext *logctx;
 static Terminal *term;
-
-struct wm_netevent_params {
-    /* Used to pass data to wm_netevent_callback */
-    WPARAM wParam;
-    LPARAM lParam;
-};
 
 static void conf_cache_data(void);
 static int cursor_type;
@@ -203,6 +198,9 @@ bool tried_pal = false;
 COLORREF colorref_modifier = 0;
 
 enum MONITOR_DPI_TYPE { MDT_EFFECTIVE_DPI, MDT_ANGULAR_DPI, MDT_RAW_DPI, MDT_DEFAULT };
+DECL_WINDOWS_FUNCTION(static, BOOL, GetMonitorInfoA, (HMONITOR, LPMONITORINFO));
+DECL_WINDOWS_FUNCTION(static, HMONITOR, MonitorFromPoint, (POINT, DWORD));
+DECL_WINDOWS_FUNCTION(static, HMONITOR, MonitorFromWindow, (HWND, DWORD));
 DECL_WINDOWS_FUNCTION(static, HRESULT, GetDpiForMonitor, (HMONITOR hmonitor, enum MONITOR_DPI_TYPE dpiType, UINT *dpiX, UINT *dpiY));
 DECL_WINDOWS_FUNCTION(static, HRESULT, GetSystemMetricsForDpi, (int nIndex, UINT dpi));
 DECL_WINDOWS_FUNCTION(static, HRESULT, AdjustWindowRectExForDpi, (LPRECT lpRect, DWORD dwStyle, BOOL bMenu, DWORD dwExStyle, UINT dpi));
@@ -225,7 +223,7 @@ static bool pointer_indicates_raw_mouse = false;
 
 static BusyStatus busy_status = BUSY_NOT;
 
-static char *window_name, *icon_name;
+static wchar_t *window_name, *icon_name;
 
 static int compose_state = 0;
 
@@ -256,14 +254,16 @@ static void wintw_clip_write(
 static void wintw_clip_request_paste(TermWin *, int clipboard);
 static void wintw_refresh(TermWin *);
 static void wintw_request_resize(TermWin *, int w, int h);
-static void wintw_set_title(TermWin *, const char *title);
-static void wintw_set_icon_title(TermWin *, const char *icontitle);
+static void wintw_set_title(TermWin *, const char *title, int codepage);
+static void wintw_set_icon_title(TermWin *, const char *icontitle,
+                                 int codepage);
 static void wintw_set_minimised(TermWin *, bool minimised);
 static void wintw_set_maximised(TermWin *, bool maximised);
 static void wintw_move(TermWin *, int x, int y);
 static void wintw_set_zorder(TermWin *, bool top);
 static void wintw_palette_set(TermWin *, unsigned, unsigned, const rgb *);
 static void wintw_palette_get_overrides(TermWin *, Terminal *);
+static void wintw_unthrottle(TermWin *win, size_t bufsize);
 
 static const TermWinVtable windows_termwin_vt = {
     .setup_draw_ctx = wintw_setup_draw_ctx,
@@ -289,6 +289,7 @@ static const TermWinVtable windows_termwin_vt = {
     .set_zorder = wintw_set_zorder,
     .palette_set = wintw_palette_set,
     .palette_get_overrides = wintw_palette_get_overrides,
+    .unthrottle = wintw_unthrottle,
 };
 
 static TermWin wintw[1];
@@ -321,30 +322,35 @@ static StripCtrlChars *win_seat_stripctrl_new(
 }
 
 static size_t win_seat_output(
-    Seat *seat, bool is_stderr, const void *, size_t);
+    Seat *seat, SeatOutputType type, const void *, size_t);
 static bool win_seat_eof(Seat *seat);
-static int win_seat_get_userpass_input(
-    Seat *seat, prompts_t *p, bufchain *input);
+static SeatPromptResult win_seat_get_userpass_input(Seat *seat, prompts_t *p);
 static void win_seat_notify_remote_exit(Seat *seat);
 static void win_seat_connection_fatal(Seat *seat, const char *msg);
 static void win_seat_update_specials_menu(Seat *seat);
 static void win_seat_set_busy_status(Seat *seat, BusyStatus status);
-static bool win_seat_set_trust_status(Seat *seat, bool trusted);
+static void win_seat_set_trust_status(Seat *seat, bool trusted);
+static bool win_seat_can_set_trust_status(Seat *seat);
 static bool win_seat_get_cursor_position(Seat *seat, int *x, int *y);
 static bool win_seat_get_window_pixel_size(Seat *seat, int *x, int *y);
 
 static const SeatVtable win_seat_vt = {
     .output = win_seat_output,
     .eof = win_seat_eof,
+    .sent = nullseat_sent,
+    .banner = nullseat_banner_to_stderr,
     .get_userpass_input = win_seat_get_userpass_input,
+    .notify_session_started = nullseat_notify_session_started,
     .notify_remote_exit = win_seat_notify_remote_exit,
+    .notify_remote_disconnect = nullseat_notify_remote_disconnect,
     .connection_fatal = win_seat_connection_fatal,
     .update_specials_menu = win_seat_update_specials_menu,
     .get_ttymode = win_seat_get_ttymode,
     .set_busy_status = win_seat_set_busy_status,
-    .verify_ssh_host_key = win_seat_verify_ssh_host_key,
+    .confirm_ssh_host_key = win_seat_confirm_ssh_host_key,
     .confirm_weak_crypto_primitive = win_seat_confirm_weak_crypto_primitive,
     .confirm_weak_cached_hostkey = win_seat_confirm_weak_cached_hostkey,
+    .prompt_descriptions = win_seat_prompt_descriptions,
     .is_utf8 = win_seat_is_utf8,
     .echoedit_update = nullseat_echoedit_update,
     .get_x_display = nullseat_get_x_display,
@@ -352,6 +358,8 @@ static const SeatVtable win_seat_vt = {
     .get_window_pixel_size = win_seat_get_window_pixel_size,
     .stripctrl_new = win_seat_stripctrl_new,
     .set_trust_status = win_seat_set_trust_status,
+    .can_set_trust_status = win_seat_can_set_trust_status,
+    .has_mixed_input_stream = nullseat_has_mixed_input_stream_yes,
     .verbose = nullseat_verbose_yes,
     .interactive = nullseat_interactive_yes,
     .get_cursor_position = win_seat_get_cursor_position,
@@ -365,18 +373,9 @@ static void start_backend(void)
     char *error, *realhost;
     int i;
 
-    /*
-     * Select protocol. This is farmed out into a table in a
-     * separate file to enable an ssh-free variant.
-     */
-    vt = backend_vt_from_proto(conf_get_int(conf, CONF_protocol));
-    if (!vt) {
-        char *str = dupprintf("%s Internal Error", appname);
-        MessageBox(NULL, "Unsupported protocol number found",
-                   str, MB_OK | MB_ICONEXCLAMATION);
-        sfree(str);
-        cleanup_exit(1);
-    }
+    cmdline_get_passwd_state = cmdline_get_passwd_input_state_new;
+
+    vt = backend_vt_from_conf(conf);
 
     seat_set_trust_status(&wgs.seat, true);
     error = backend_init(vt, &wgs.seat, &backend, logctx, conf,
@@ -387,8 +386,14 @@ static void start_backend(void)
                          conf_get_bool(conf, CONF_tcp_keepalives));
     if (error) {
         char *str = dupprintf("%s Error", appname);
-        char *msg = dupprintf("Unable to open connection to\n%s\n%s",
-                              conf_dest(conf), error);
+        char *msg;
+        if (cmdline_tooltype & TOOLTYPE_NONNETWORK) {
+            /* Special case for pterm. */
+            msg = dupprintf("Unable to open terminal:\n%s", error);
+        } else {
+            msg = dupprintf("Unable to open connection to\n%s\n%s",
+                            conf_dest(conf), error);
+        }
         sfree(error);
         MessageBox(NULL, msg, str, MB_ICONERROR | MB_OK);
         sfree(str);
@@ -429,8 +434,8 @@ static void close_session(void *ignored_context)
 
     session_closed = true;
     newtitle = dupprintf("%s (inactive)", appname);
-    win_set_icon_title(wintw, newtitle);
-    win_set_title(wintw, newtitle);
+    win_set_icon_title(wintw, newtitle, DEFAULT_CODEPAGE);
+    win_set_title(wintw, newtitle, DEFAULT_CODEPAGE);
     sfree(newtitle);
 
     if (ldisc) {
@@ -455,10 +460,71 @@ static void close_session(void *ignored_context)
     }
 }
 
-const unsigned cmdline_tooltype =
-    TOOLTYPE_HOST_ARG |
-    TOOLTYPE_PORT_ARG |
-    TOOLTYPE_NO_VERBOSE_OPTION;
+/*
+ * Some machinery to deal with switching the window type between ANSI
+ * and Unicode. We prefer Unicode, but some PuTTY builds still try to
+ * run on machines so old that they don't support that mode. So we're
+ * prepared to fall back to an ANSI window if we have to. For this
+ * purpose, we swap out a few Windows API functions, and wrap
+ * SetWindowText so that if we're not in Unicode mode we first convert
+ * the wide string we're given.
+ */
+static bool unicode_window;
+static BOOL (WINAPI *sw_PeekMessage)(LPMSG, HWND, UINT, UINT, UINT);
+static LRESULT (WINAPI *sw_DispatchMessage)(const MSG *);
+static LRESULT (WINAPI *sw_DefWindowProc)(HWND, UINT, WPARAM, LPARAM);
+static void sw_SetWindowText(HWND hwnd, wchar_t *text)
+{
+    if (unicode_window) {
+        SetWindowTextW(hwnd, text);
+    } else {
+        char *mb = dup_wc_to_mb(DEFAULT_CODEPAGE, 0, text, "?");
+        SetWindowTextA(hwnd, mb);
+        sfree(mb);
+    }
+}
+
+static HINSTANCE hprev;
+
+/*
+ * Also, registering window classes has to be done in a fiddly way.
+ */
+#define SETUP_WNDCLASS(wndclass, classname) do {                        \
+        wndclass.style = 0;                                             \
+        wndclass.lpfnWndProc = WndProc;                                 \
+        wndclass.cbClsExtra = 0;                                        \
+        wndclass.cbWndExtra = 0;                                        \
+        wndclass.hInstance = hinst;                                     \
+        wndclass.hIcon = LoadIcon(hinst, MAKEINTRESOURCE(IDI_MAINICON)); \
+        wndclass.hCursor = LoadCursor(NULL, IDC_IBEAM);                 \
+        wndclass.hbrBackground = NULL;                                  \
+        wndclass.lpszMenuName = NULL;                                   \
+        wndclass.lpszClassName = classname;                             \
+    } while (0)
+wchar_t *terminal_window_class_w(void)
+{
+    static wchar_t *classname = NULL;
+    if (!classname)
+        classname = dup_mb_to_wc(DEFAULT_CODEPAGE, 0, appname);
+    if (!hprev) {
+        WNDCLASSW wndclassw;
+        SETUP_WNDCLASS(wndclassw, classname);
+        RegisterClassW(&wndclassw);
+    }
+    return classname;
+}
+char *terminal_window_class_a(void)
+{
+    static char *classname = NULL;
+    if (!classname)
+        classname = dupcat(appname, ".ansi");
+    if (!hprev) {
+        WNDCLASSA wndclassa;
+        SETUP_WNDCLASS(wndclassa, classname);
+        RegisterClassA(&wndclassa);
+    }
+    return classname;
+}
 
 HINSTANCE hinst;
 
@@ -471,6 +537,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
     dll_hijacking_protection();
 
     hinst = inst;
+    hprev = prev;
 
     sk_init();
 
@@ -517,173 +584,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
     /*
      * Process the command line.
      */
-    {
-        char *p;
-        bool special_launchable_argument = false;
-
-        settings_set_default_protocol(be_default_protocol);
-        /* Find the appropriate default port. */
-        {
-            const struct BackendVtable *vt =
-                backend_vt_from_proto(be_default_protocol);
-            settings_set_default_port(0); /* illegal */
-            if (vt)
-                settings_set_default_port(vt->default_port);
-        }
-        conf_set_int(conf, CONF_logtype, LGTYP_NONE);
-
-        do_defaults(NULL, conf);
-
-        p = cmdline;
-
-        /*
-         * Process a couple of command-line options which are more
-         * easily dealt with before the line is broken up into words.
-         * These are the old-fashioned but convenient @sessionname and
-         * the internal-use-only &sharedmemoryhandle, plus the &R
-         * prefix for -restrict-acl, all of which are used by PuTTYs
-         * auto-launching each other via System-menu options.
-         */
-        while (*p && isspace(*p))
-            p++;
-        if (*p == '&' && p[1] == 'R' &&
-            (!p[2] || p[2] == '@' || p[2] == '&')) {
-            /* &R restrict-acl prefix */
-            restrict_process_acl();
-            p += 2;
-        }
-
-        if (*p == '@') {
-            /*
-             * An initial @ means that the whole of the rest of the
-             * command line should be treated as the name of a saved
-             * session, with _no quoting or escaping_. This makes it a
-             * very convenient means of automated saved-session
-             * launching, via IDM_SAVEDSESS or Windows 7 jump lists.
-             */
-            int i = strlen(p);
-            while (i > 1 && isspace(p[i - 1]))
-                i--;
-            p[i] = '\0';
-            do_defaults(p + 1, conf);
-            if (!conf_launchable(conf) && !do_config(conf)) {
-                cleanup_exit(0);
-            }
-            special_launchable_argument = true;
-        } else if (*p == '&') {
-            /*
-             * An initial & means we've been given a command line
-             * containing the hex value of a HANDLE for a file
-             * mapping object, which we must then interpret as a
-             * serialised Conf.
-             */
-            HANDLE filemap;
-            void *cp;
-            unsigned cpsize;
-            if (sscanf(p + 1, "%p:%u", &filemap, &cpsize) == 2 &&
-                (cp = MapViewOfFile(filemap, FILE_MAP_READ,
-                                    0, 0, cpsize)) != NULL) {
-                BinarySource src[1];
-                BinarySource_BARE_INIT(src, cp, cpsize);
-                if (!conf_deserialise(conf, src))
-                    modalfatalbox("Serialised configuration data was invalid");
-                UnmapViewOfFile(cp);
-                CloseHandle(filemap);
-            } else if (!do_config(conf)) {
-                cleanup_exit(0);
-            }
-            special_launchable_argument = true;
-        } else if (!*p) {
-            /* Do-nothing case for an empty command line - or rather,
-             * for a command line that's empty _after_ we strip off
-             * the &R prefix. */
-        } else {
-            /*
-             * Otherwise, break up the command line and deal with
-             * it sensibly.
-             */
-            int argc, i;
-            char **argv;
-
-            split_into_argv(cmdline, &argc, &argv, NULL);
-
-            for (i = 0; i < argc; i++) {
-                char *p = argv[i];
-                int ret;
-
-                ret = cmdline_process_param(p, i+1<argc?argv[i+1]:NULL,
-                                            1, conf);
-                if (ret == -2) {
-                    cmdline_error("option \"%s\" requires an argument", p);
-                } else if (ret == 2) {
-                    i++;               /* skip next argument */
-                } else if (ret == 1) {
-                    continue;          /* nothing further needs doing */
-                } else if (!strcmp(p, "-cleanup")) {
-                    /*
-                     * `putty -cleanup'. Remove all registry
-                     * entries associated with PuTTY, and also find
-                     * and delete the random seed file.
-                     */
-                    char *s1, *s2;
-                    s1 = dupprintf("This procedure will remove ALL Registry entries\n"
-                                   "associated with %s, and will also remove\n"
-                                   "the random seed file. (This only affects the\n"
-                                   "currently logged-in user.)\n"
-                                   "\n"
-                                   "THIS PROCESS WILL DESTROY YOUR SAVED SESSIONS.\n"
-                                   "Are you really sure you want to continue?",
-                                   appname);
-                    s2 = dupprintf("%s Warning", appname);
-                    if (message_box(NULL, s1, s2,
-                                    MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
-                                    HELPCTXID(option_cleanup)) == IDYES) {
-                        cleanup_all();
-                    }
-                    sfree(s1);
-                    sfree(s2);
-                    exit(0);
-                } else if (!strcmp(p, "-pgpfp")) {
-                    pgp_fingerprints_msgbox(NULL);
-                    exit(1);
-                } else if (*p != '-') {
-                    cmdline_error("unexpected argument \"%s\"", p);
-                } else {
-                    cmdline_error("unknown option \"%s\"", p);
-                }
-            }
-        }
-
-        cmdline_run_saved(conf);
-
-        /*
-         * Bring up the config dialog if the command line hasn't
-         * (explicitly) specified a launchable configuration.
-         */
-        if (!(special_launchable_argument || cmdline_host_ok(conf))) {
-            if (!do_config(conf))
-                cleanup_exit(0);
-        }
-
-        prepare_session(conf);
-    }
-
-    if (!prev) {
-        WNDCLASSW wndclass;
-
-        wndclass.style = 0;
-        wndclass.lpfnWndProc = WndProc;
-        wndclass.cbClsExtra = 0;
-        wndclass.cbWndExtra = 0;
-        wndclass.hInstance = inst;
-        wndclass.hIcon = LoadIcon(inst, MAKEINTRESOURCE(IDI_MAINICON));
-        wndclass.hCursor = LoadCursor(NULL, IDC_IBEAM);
-        wndclass.hbrBackground = NULL;
-        wndclass.lpszMenuName = NULL;
-        wndclass.lpszClassName = dup_mb_to_wc(DEFAULT_CODEPAGE, 0, appname);
-
-        RegisterClassW(&wndclass);
-    }
+    gui_term_process_cmdline(conf, cmdline);
 
     memset(&ucsdata, 0, sizeof(ucsdata));
 
@@ -720,6 +621,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
         if (vt && vt->flags & BACKEND_RESIZE_FORBIDDEN)
             resize_forbidden = true;
         wchar_t *uappname = dup_mb_to_wc(DEFAULT_CODEPAGE, 0, appname);
+        window_name = dup_mb_to_wc(DEFAULT_CODEPAGE, 0, appname);
+        icon_name = dup_mb_to_wc(DEFAULT_CODEPAGE, 0, appname);
         if (!conf_get_bool(conf, CONF_scrollbar))
             winmode &= ~(WS_VSCROLL);
         if (conf_get_int(conf, CONF_resize_action) == RESIZE_DISABLED ||
@@ -729,9 +632,42 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
             exwinmode |= WS_EX_TOPMOST;
         if (conf_get_bool(conf, CONF_sunken_edge))
             exwinmode |= WS_EX_CLIENTEDGE;
+
+#ifdef TEST_ANSI_WINDOW
+        /* For developer testing of ANSI window support, pretend
+         * CreateWindowExW failed */
+        wgs.term_hwnd = NULL;
+        SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+#else
+        unicode_window = true;
+        sw_PeekMessage = PeekMessageW;
+        sw_DispatchMessage = DispatchMessageW;
+        sw_DefWindowProc = DefWindowProcW;
         wgs.term_hwnd = CreateWindowExW(
-            exwinmode, uappname, uappname, winmode, CW_USEDEFAULT,
-            CW_USEDEFAULT, guess_width, guess_height, NULL, NULL, inst, NULL);
+            exwinmode, terminal_window_class_w(), uappname,
+            winmode, CW_USEDEFAULT, CW_USEDEFAULT,
+            guess_width, guess_height, NULL, NULL, inst, NULL);
+#endif
+
+#if defined LEGACY_WINDOWS || defined TEST_ANSI_WINDOW
+        if (!wgs.term_hwnd && GetLastError() == ERROR_CALL_NOT_IMPLEMENTED) {
+            /* Fall back to an ANSI window, swapping in all the ANSI
+             * window message handling functions */
+            unicode_window = false;
+            sw_PeekMessage = PeekMessageA;
+            sw_DispatchMessage = DispatchMessageA;
+            sw_DefWindowProc = DefWindowProcA;
+            wgs.term_hwnd = CreateWindowExA(
+                exwinmode, terminal_window_class_a(), appname,
+                winmode, CW_USEDEFAULT, CW_USEDEFAULT,
+                guess_width, guess_height, NULL, NULL, inst, NULL);
+        }
+#endif
+
+        if (!wgs.term_hwnd) {
+            modalfatalbox("Unable to create terminal window: %s",
+                          win_strerror(GetLastError()));
+        }
         memset(&dpi_info, 0, sizeof(struct _dpi_info));
         init_dpi_info();
         sfree(uappname);
@@ -885,9 +821,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
     term_set_focus(term, GetForegroundWindow() == wgs.term_hwnd);
     UpdateWindow(wgs.term_hwnd);
 
+    gui_terminal_ready(wgs.term_hwnd, &wgs.seat, backend);
+
     while (1) {
-        HANDLE *handles;
-        int nhandles, n;
+        int n;
         DWORD timeout;
 
         if (toplevel_callback_pending() ||
@@ -916,24 +853,22 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
             term_set_focus(term, GetForegroundWindow() == wgs.term_hwnd);
         }
 
-        handles = handle_get_events(&nhandles);
+        HandleWaitList *hwl = get_handle_wait_list();
 
-        n = MsgWaitForMultipleObjects(nhandles, handles, false,
+        n = MsgWaitForMultipleObjects(hwl->nhandles, hwl->handles, false,
                                       timeout, QS_ALLINPUT);
 
-        if ((unsigned)(n - WAIT_OBJECT_0) < (unsigned)nhandles) {
-            handle_got_event(handles[n - WAIT_OBJECT_0]);
-            sfree(handles);
-        } else
-            sfree(handles);
+        if ((unsigned)(n - WAIT_OBJECT_0) < (unsigned)hwl->nhandles)
+            handle_wait_activate(hwl, n - WAIT_OBJECT_0);
+        handle_wait_list_free(hwl);
 
-        while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
+        while (sw_PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
             if (msg.message == WM_QUIT)
                 goto finished;         /* two-level break */
 
             HWND logbox = event_log_window();
             if (!(IsWindow(logbox) && IsDialogMessage(logbox, &msg)))
-                DispatchMessageW(&msg);
+                sw_DispatchMessage(&msg);
 
             /*
              * WM_NETEVENT messages seem to jump ahead of others in
@@ -961,9 +896,91 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
         run_toplevel_callbacks();
     }
 
-    finished:
+  finished:
     cleanup_exit(msg.wParam);          /* this doesn't return... */
     return msg.wParam;                 /* ... but optimiser doesn't know */
+}
+
+char *handle_restrict_acl_cmdline_prefix(char *p)
+{
+    /*
+     * Process the &R prefix on a command line, which is equivalent to
+     * -restrict-acl but lexically easier to prepend when another
+     * instance of ourself automatically constructs a command line.
+     *
+     * If successful, restricts the process ACL and advances the input
+     * pointer past the prefix. Returns the updated pointer (whether
+     * it moved or not).
+     */
+    while (*p && isspace((unsigned char)*p))
+        p++;
+    if (*p == '&' && p[1] == 'R' &&
+        (!p[2] || p[2] == '@' || p[2] == '&')) {
+        /* &R restrict-acl prefix */
+        restrict_process_acl();
+        p += 2;
+    }
+    return p;
+}
+
+bool handle_special_sessionname_cmdline(char *p, Conf *conf)
+{
+    /*
+     * Process the special form of command line with an initial @
+     * followed by the name of a saved session with _no quoting or
+     * escaping_. This is a very convenient means of automated
+     * saved-session launching, via IDM_SAVEDSESS or Windows 7 jump
+     * lists.
+     *
+     * If successful, the whole command line has been interpreted in
+     * this way, so there's nothing left to parse into other arguments.
+     */
+    if (*p != '@')
+        return false;
+
+    ptrlen sessionname = ptrlen_from_asciz(p + 1);
+    while (sessionname.len > 0 &&
+           isspace(((unsigned char *)sessionname.ptr)[sessionname.len-1]))
+        sessionname.len--;
+
+    char *dup = mkstr(sessionname);
+    bool loaded = do_defaults(dup, conf);
+    sfree(dup);
+
+    return loaded;
+}
+
+bool handle_special_filemapping_cmdline(char *p, Conf *conf)
+{
+    /*
+     * Process the special form of command line with an initial &
+     * followed by the hex value of a HANDLE for a file mapping object
+     * and the size of the data contained in it, which we must
+     * interpret as a serialised Conf.
+     *
+     * If successful, the whole command line has been interpreted in
+     * this way, so there's nothing left to parse into other arguments.
+     */
+
+    if (*p != '&')
+        return false;
+
+    HANDLE filemap;
+    unsigned cpsize;
+    if (sscanf(p + 1, "%p:%u", &filemap, &cpsize) != 2)
+        return false;
+
+    void *cp = MapViewOfFile(filemap, FILE_MAP_READ, 0, 0, cpsize);
+    if (!cp)
+        return false;
+
+    BinarySource src[1];
+    BinarySource_BARE_INIT(src, cp, cpsize);
+    if (!conf_deserialise(conf, src))
+        modalfatalbox("Serialised configuration data was invalid");
+    UnmapViewOfFile(cp);
+    CloseHandle(filemap);
+    return true;
 }
 
 static void setup_clipboards(Terminal *term, Conf *conf)
@@ -1004,9 +1021,7 @@ void cleanup_exit(int code)
         DeleteObject(pal);
     sk_cleanup();
 
-    if (conf_get_int(conf, CONF_protocol) == PROT_SSH) {
-        random_save_seed();
-    }
+    random_save_seed();
     shutdown_help();
 
     /* Clean up COM. */
@@ -1195,16 +1210,6 @@ void cmdline_error(const char *fmt, ...)
     exit(1);
 }
 
-/*
- * Actually do the job requested by a WM_NETEVENT
- */
-static void wm_netevent_callback(void *vctx)
-{
-    struct wm_netevent_params *params = (struct wm_netevent_params *)vctx;
-    select_result(params->wParam, params->lParam);
-    sfree(vctx);
-}
-
 static inline rgb rgb_from_colorref(COLORREF cr)
 {
     rgb toret;
@@ -1245,16 +1250,16 @@ static void exact_textout(HDC hdc, int x, int y, CONST RECT *lprc,
                           unsigned short *lpString, UINT cbCount,
                           CONST INT *lpDx, bool opaque)
 {
-#ifdef __LCC__
+#if HAVE_GCP_RESULTSW
+    GCP_RESULTSW gcpr;
+#else
     /*
-     * The LCC include files apparently don't supply the
-     * GCP_RESULTSW type, but we can make do with GCP_RESULTS
-     * proper: the differences aren't important to us (the only
-     * variable-width string parameter is one we don't use anyway).
+     * If building against old enough headers that the GCP_RESULTSW
+     * type isn't available, we can make do with GCP_RESULTS proper:
+     * the differences aren't important to us (the only variable-width
+     * string parameter is one we don't use anyway).
      */
     GCP_RESULTS gcpr;
-#else
-    GCP_RESULTSW gcpr;
 #endif
     char *buffer = snewn(cbCount*2+2, char);
     char *classbuffer = snewn(cbCount, char);
@@ -1365,9 +1370,9 @@ static int get_font_width(HDC hdc, const TEXTMETRIC *tm)
 static void init_dpi_info(void)
 {
     if (dpi_info.cur_dpi.x == 0 || dpi_info.cur_dpi.y == 0) {
-        if (p_GetDpiForMonitor) {
+        if (p_GetDpiForMonitor && p_MonitorFromWindow) {
             UINT dpiX, dpiY;
-            HMONITOR currentMonitor = MonitorFromWindow(
+            HMONITOR currentMonitor = p_MonitorFromWindow(
                 wgs.term_hwnd, MONITOR_DEFAULTTOPRIMARY);
             if (p_GetDpiForMonitor(currentMonitor, MDT_EFFECTIVE_DPI,
                                    &dpiX, &dpiY) == S_OK) {
@@ -1491,10 +1496,9 @@ static void init_fonts(int pick_width, int pick_height)
         /* !!! Yes the next line is right */
         if (cset == OEM_CHARSET)
             ucsdata.font_codepage = GetOEMCP();
-        else
-            if (TranslateCharsetInfo ((DWORD *)(ULONG_PTR)cset,
-                                      &info, TCI_SRCCHARSET))
-                ucsdata.font_codepage = info.ciACP;
+        else if (TranslateCharsetInfo ((DWORD *)(ULONG_PTR)cset,
+                                       &info, TCI_SRCCHARSET))
+            ucsdata.font_codepage = info.ciACP;
         else
             ucsdata.font_codepage = -1;
 
@@ -1674,40 +1678,40 @@ static void wintw_request_resize(TermWin *tw, int w, int h)
 {
     const struct BackendVtable *vt;
     int width, height;
+    int resize_action = conf_get_int(conf, CONF_resize_action);
+    bool deny_resize = false;
 
-    /* If the window is maximized suppress resizing attempts */
-    if (IsZoomed(wgs.term_hwnd)) {
-        if (conf_get_int(conf, CONF_resize_action) == RESIZE_TERM)
-            return;
+    /* Suppress server-originated resizing attempts if local resizing
+     * is disabled entirely, or if it's supposed to change
+     * rows/columns but the window is maximised. */
+    if (resize_action == RESIZE_DISABLED
+        || (resize_action == RESIZE_TERM && IsZoomed(wgs.term_hwnd))) {
+        deny_resize = true;
     }
 
-    if (conf_get_int(conf, CONF_resize_action) == RESIZE_DISABLED) return;
     vt = backend_vt_from_proto(be_default_protocol);
     if (vt && vt->flags & BACKEND_RESIZE_FORBIDDEN)
+        deny_resize = true;
+    if (h == term->rows && w == term->cols) deny_resize = true;
+
+    /* We still need to acknowledge a suppressed resize attempt. */
+    if (deny_resize) {
+        term_resize_request_completed(term);
         return;
-    if (h == term->rows && w == term->cols) return;
+    }
 
     /* Sanity checks ... */
     {
-        static int first_time = 1;
-        static RECT ss;
-
-        switch (first_time) {
-          case 1:
-            /* Get the size of the screen */
-            if (get_fullscreen_rect(&ss))
-                /* first_time = 0 */ ;
-            else {
-                first_time = 2;
-                break;
-            }
-          case 0:
-            /* Make sure the values are sane */
+        RECT ss;
+        if (get_fullscreen_rect(&ss)) {
+            /* Make sure the values aren't too big */
             width = (ss.right - ss.left - extra_width) / 4;
             height = (ss.bottom - ss.top - extra_height) / 6;
 
-            if (w > width || h > height)
+            if (w > width || h > height) {
+                term_resize_request_completed(term);
                 return;
+            }
             if (w < 15)
                 w = 15;
             if (h < 1)
@@ -1715,19 +1719,24 @@ static void wintw_request_resize(TermWin *tw, int w, int h)
         }
     }
 
-    term_size(term, h, w, conf_get_int(conf, CONF_savelines));
-
-    if (conf_get_int(conf, CONF_resize_action) != RESIZE_FONT &&
-        !IsZoomed(wgs.term_hwnd)) {
+    if (resize_action != RESIZE_FONT && !IsZoomed(wgs.term_hwnd)) {
         width = extra_width + font_width * w;
         height = extra_height + font_height * h;
 
         SetWindowPos(wgs.term_hwnd, NULL, 0, 0, width, height,
-            SWP_NOACTIVATE | SWP_NOCOPYBITS |
-            SWP_NOMOVE | SWP_NOZORDER);
-    } else
+                     SWP_NOACTIVATE | SWP_NOCOPYBITS |
+                     SWP_NOMOVE | SWP_NOZORDER);
+    } else {
+        /*
+         * If we're resizing by changing the font, we must tell the
+         * terminal the new size immediately, so that reset_window
+         * will know what to do.
+         */
+        term_size(term, h, w, conf_get_int(conf, CONF_savelines));
         reset_window(0);
+    }
 
+    term_resize_request_completed(term);
     InvalidateRect(wgs.term_hwnd, NULL, true);
 }
 
@@ -1855,10 +1864,10 @@ static void reset_window(int reinit) {
         rect.right += (window_border * 2);
         rect.bottom += (window_border * 2);
         OffsetRect(&dpi_info.new_wnd_rect,
-            ((dpi_info.new_wnd_rect.right - dpi_info.new_wnd_rect.left) -
-             (rect.right - rect.left)) / 2,
-            ((dpi_info.new_wnd_rect.bottom - dpi_info.new_wnd_rect.top) -
-             (rect.bottom - rect.top)) / 2);
+                   ((dpi_info.new_wnd_rect.right - dpi_info.new_wnd_rect.left) -
+                    (rect.right - rect.left)) / 2,
+                   ((dpi_info.new_wnd_rect.bottom - dpi_info.new_wnd_rect.top) -
+                    (rect.bottom - rect.top)) / 2);
         SetWindowPos(wgs.term_hwnd, NULL,
                      dpi_info.new_wnd_rect.left, dpi_info.new_wnd_rect.top,
                      rect.right - rect.left, rect.bottom - rect.top,
@@ -1903,7 +1912,7 @@ static void reset_window(int reinit) {
      */
     if ((resize_action == RESIZE_TERM && reinit<=0) ||
         (resize_action == RESIZE_EITHER && reinit<0) ||
-            reinit>0) {
+        reinit>0) {
         offset_width = offset_height = window_border;
         extra_width = wr.right - wr.left - cr.right + cr.left + offset_width*2;
         extra_height = wr.bottom - wr.top - cr.bottom + cr.top +offset_height*2;
@@ -1914,7 +1923,7 @@ static void reset_window(int reinit) {
             static RECT ss;
             int width, height;
 
-                get_fullscreen_rect(&ss);
+            get_fullscreen_rect(&ss);
 
             width = (ss.right - ss.left - extra_width) / font_width;
             height = (ss.bottom - ss.top - extra_height) / font_height;
@@ -2031,10 +2040,10 @@ static Mouse_Button translate_button(Mouse_Button button)
         return MBT_SELECT;
     if (button == MBT_MIDDLE)
         return conf_get_int(conf, CONF_mouse_is_xterm) == 1 ?
-        MBT_PASTE : MBT_EXTEND;
+            MBT_PASTE : MBT_EXTEND;
     if (button == MBT_RIGHT)
         return conf_get_int(conf, CONF_mouse_is_xterm) == 1 ?
-        MBT_EXTEND : MBT_PASTE;
+            MBT_EXTEND : MBT_PASTE;
     return 0;                          /* shouldn't happen */
 }
 
@@ -2067,7 +2076,7 @@ static bool is_alt_pressed(void)
 
 static bool resizing;
 
-static void win_seat_notify_remote_exit(Seat *seat)
+static void exit_callback(void *vctx)
 {
     int exitcode, close_on_exit;
 
@@ -2092,6 +2101,11 @@ static void win_seat_notify_remote_exit(Seat *seat)
             }
         }
     }
+}
+
+static void win_seat_notify_remote_exit(Seat *seat)
+{
+    queue_toplevel_callback(exit_callback, NULL);
 }
 
 void timer_change_notify(unsigned long next)
@@ -2243,7 +2257,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
                  * within an interactive scrollbar-drag can be handled
                  * differently. */
                 in_scrollbar_loop = true;
-                LRESULT result = DefWindowProcW(hwnd, message, wParam, lParam);
+                LRESULT result = sw_DefWindowProc(
+                    hwnd, message, wParam, lParam);
                 in_scrollbar_loop = false;
                 return result;
             }
@@ -2268,52 +2283,52 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
                 argprefix = "";
 
             if (wParam == IDM_DUPSESS) {
-              /*
-               * Allocate a file-mapping memory chunk for the
-               * config structure.
-               */
-              SECURITY_ATTRIBUTES sa;
-              strbuf *serbuf;
-              void *p;
-              int size;
+                /*
+                 * Allocate a file-mapping memory chunk for the
+                 * config structure.
+                 */
+                SECURITY_ATTRIBUTES sa;
+                strbuf *serbuf;
+                void *p;
+                int size;
 
-              serbuf = strbuf_new();
-              conf_serialise(BinarySink_UPCAST(serbuf), conf);
-              size = serbuf->len;
+                serbuf = strbuf_new();
+                conf_serialise(BinarySink_UPCAST(serbuf), conf);
+                size = serbuf->len;
 
-              sa.nLength = sizeof(sa);
-              sa.lpSecurityDescriptor = NULL;
-              sa.bInheritHandle = true;
-              filemap = CreateFileMapping(INVALID_HANDLE_VALUE,
-                                          &sa,
-                                          PAGE_READWRITE,
-                                          0, size, NULL);
-              if (filemap && filemap != INVALID_HANDLE_VALUE) {
-                p = MapViewOfFile(filemap, FILE_MAP_WRITE, 0, 0, size);
-                if (p) {
-                  memcpy(p, serbuf->s, size);
-                  UnmapViewOfFile(p);
+                sa.nLength = sizeof(sa);
+                sa.lpSecurityDescriptor = NULL;
+                sa.bInheritHandle = true;
+                filemap = CreateFileMapping(INVALID_HANDLE_VALUE,
+                                            &sa,
+                                            PAGE_READWRITE,
+                                            0, size, NULL);
+                if (filemap && filemap != INVALID_HANDLE_VALUE) {
+                    p = MapViewOfFile(filemap, FILE_MAP_WRITE, 0, 0, size);
+                    if (p) {
+                        memcpy(p, serbuf->s, size);
+                        UnmapViewOfFile(p);
+                    }
                 }
-              }
 
-              strbuf_free(serbuf);
-              inherit_handles = true;
-              cl = dupprintf("putty %s&%p:%u", argprefix,
-                             filemap, (unsigned)size);
+                strbuf_free(serbuf);
+                inherit_handles = true;
+                cl = dupprintf("putty %s&%p:%u", argprefix,
+                               filemap, (unsigned)size);
             } else if (wParam == IDM_SAVEDSESS) {
-              unsigned int sessno = ((lParam - IDM_SAVED_MIN)
-                                     / MENU_SAVED_STEP) + 1;
-              if (sessno < (unsigned)sesslist.nsessions) {
-                const char *session = sesslist.sessions[sessno];
-                cl = dupprintf("putty %s@%s", argprefix, session);
-                inherit_handles = false;
-              } else
-                  break;
+                unsigned int sessno = ((lParam - IDM_SAVED_MIN)
+                                       / MENU_SAVED_STEP) + 1;
+                if (sessno < (unsigned)sesslist.nsessions) {
+                    const char *session = sesslist.sessions[sessno];
+                    cl = dupprintf("putty %s@%s", argprefix, session);
+                    inherit_handles = false;
+                } else
+                    break;
             } else /* IDM_NEWSESS */ {
-              cl = dupprintf("putty%s%s",
-                             *argprefix ? " " : "",
-                             argprefix);
-              inherit_handles = false;
+                cl = dupprintf("putty%s%s",
+                               *argprefix ? " " : "",
+                               argprefix);
+                inherit_handles = false;
             }
 
             GetModuleFileName(NULL, b, sizeof(b) - 1);
@@ -2359,24 +2374,24 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
                 hwnd, conf, backend ? backend_cfg_info(backend) : 0);
             reconfiguring = false;
             if (!reconfig_result) {
-              conf_free(prev_conf);
-              break;
+                conf_free(prev_conf);
+                break;
             }
 
             conf_cache_data();
 
             resize_action = conf_get_int(conf, CONF_resize_action);
             {
-              /* Disable full-screen if resizing forbidden */
-              int i;
-              for (i = 0; i < lenof(popup_menus); i++)
-                  EnableMenuItem(popup_menus[i].menu, IDM_FULLSCREEN,
-                                 MF_BYCOMMAND |
-                                 (resize_action == RESIZE_DISABLED
-                                  ? MF_GRAYED : MF_ENABLED));
-              /* Gracefully unzoom if necessary */
-              if (IsZoomed(hwnd) && (resize_action == RESIZE_DISABLED))
-                  ShowWindow(hwnd, SW_RESTORE);
+                /* Disable full-screen if resizing forbidden */
+                int i;
+                for (i = 0; i < lenof(popup_menus); i++)
+                    EnableMenuItem(popup_menus[i].menu, IDM_FULLSCREEN,
+                                   MF_BYCOMMAND |
+                                   (resize_action == RESIZE_DISABLED
+                                    ? MF_GRAYED : MF_ENABLED));
+                /* Gracefully unzoom if necessary */
+                if (IsZoomed(hwnd) && (resize_action == RESIZE_DISABLED))
+                    ShowWindow(hwnd, SW_RESTORE);
             }
 
             /* Pass new config data to the logging module */
@@ -2388,8 +2403,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
              * case where local editing has just been disabled.
              */
             if (ldisc) {
-              ldisc_configure(ldisc, conf);
-              ldisc_echoedit_update(ldisc);
+                ldisc_configure(ldisc, conf);
+                ldisc_echoedit_update(ldisc);
             }
 
             if (conf_get_bool(conf, CONF_system_colour) !=
@@ -2428,90 +2443,90 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
 
             /* Enable or disable the scroll bar, etc */
             {
-              LONG nflg, flag = GetWindowLongPtr(hwnd, GWL_STYLE);
-              LONG nexflag, exflag =
-                  GetWindowLongPtr(hwnd, GWL_EXSTYLE);
+                LONG nflg, flag = GetWindowLongPtr(hwnd, GWL_STYLE);
+                LONG nexflag, exflag =
+                    GetWindowLongPtr(hwnd, GWL_EXSTYLE);
 
-              nexflag = exflag;
-              if (conf_get_bool(conf, CONF_alwaysontop) !=
-                  conf_get_bool(prev_conf, CONF_alwaysontop)) {
-                if (conf_get_bool(conf, CONF_alwaysontop)) {
-                  nexflag |= WS_EX_TOPMOST;
-                  SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
-                               SWP_NOMOVE | SWP_NOSIZE);
-                } else {
-                  nexflag &= ~(WS_EX_TOPMOST);
-                  SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
-                               SWP_NOMOVE | SWP_NOSIZE);
+                nexflag = exflag;
+                if (conf_get_bool(conf, CONF_alwaysontop) !=
+                    conf_get_bool(prev_conf, CONF_alwaysontop)) {
+                    if (conf_get_bool(conf, CONF_alwaysontop)) {
+                        nexflag |= WS_EX_TOPMOST;
+                        SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                                     SWP_NOMOVE | SWP_NOSIZE);
+                    } else {
+                        nexflag &= ~(WS_EX_TOPMOST);
+                        SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+                                     SWP_NOMOVE | SWP_NOSIZE);
+                    }
                 }
-              }
-              if (conf_get_bool(conf, CONF_sunken_edge))
-                  nexflag |= WS_EX_CLIENTEDGE;
-              else
-                  nexflag &= ~(WS_EX_CLIENTEDGE);
+                if (conf_get_bool(conf, CONF_sunken_edge))
+                    nexflag |= WS_EX_CLIENTEDGE;
+                else
+                    nexflag &= ~(WS_EX_CLIENTEDGE);
 
-              nflg = flag;
-              if (conf_get_bool(conf, is_full_screen() ?
-                                CONF_scrollbar_in_fullscreen :
-                                CONF_scrollbar))
-                  nflg |= WS_VSCROLL;
-              else
-                  nflg &= ~WS_VSCROLL;
+                nflg = flag;
+                if (conf_get_bool(conf, is_full_screen() ?
+                                  CONF_scrollbar_in_fullscreen :
+                                  CONF_scrollbar))
+                    nflg |= WS_VSCROLL;
+                else
+                    nflg &= ~WS_VSCROLL;
 
-              if (resize_action == RESIZE_DISABLED ||
-                  is_full_screen())
-                  nflg &= ~WS_THICKFRAME;
-              else
-                  nflg |= WS_THICKFRAME;
+                if (resize_action == RESIZE_DISABLED ||
+                    is_full_screen())
+                    nflg &= ~WS_THICKFRAME;
+                else
+                    nflg |= WS_THICKFRAME;
 
-              if (resize_action == RESIZE_DISABLED)
-                  nflg &= ~WS_MAXIMIZEBOX;
-              else
-                  nflg |= WS_MAXIMIZEBOX;
+                if (resize_action == RESIZE_DISABLED)
+                    nflg &= ~WS_MAXIMIZEBOX;
+                else
+                    nflg |= WS_MAXIMIZEBOX;
 
-              if (nflg != flag || nexflag != exflag) {
-                if (nflg != flag)
-                    SetWindowLongPtr(hwnd, GWL_STYLE, nflg);
-                if (nexflag != exflag)
-                    SetWindowLongPtr(hwnd, GWL_EXSTYLE, nexflag);
+                if (nflg != flag || nexflag != exflag) {
+                    if (nflg != flag)
+                        SetWindowLongPtr(hwnd, GWL_STYLE, nflg);
+                    if (nexflag != exflag)
+                        SetWindowLongPtr(hwnd, GWL_EXSTYLE, nexflag);
 
-                SetWindowPos(hwnd, NULL, 0, 0, 0, 0,
-                             SWP_NOACTIVATE | SWP_NOCOPYBITS |
-                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
-                             SWP_FRAMECHANGED);
+                    SetWindowPos(hwnd, NULL, 0, 0, 0, 0,
+                                 SWP_NOACTIVATE | SWP_NOCOPYBITS |
+                                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+                                 SWP_FRAMECHANGED);
 
-                init_lvl = 2;
-              }
+                    init_lvl = 2;
+                }
             }
 
             /* Oops */
             if (resize_action == RESIZE_DISABLED && IsZoomed(hwnd)) {
-              force_normal(hwnd);
-              init_lvl = 2;
+                force_normal(hwnd);
+                init_lvl = 2;
             }
 
             {
-              FontSpec *font = conf_get_fontspec(conf, CONF_font);
-              FontSpec *prev_font = conf_get_fontspec(prev_conf,
-                                                      CONF_font);
+                FontSpec *font = conf_get_fontspec(conf, CONF_font);
+                FontSpec *prev_font = conf_get_fontspec(prev_conf,
+                                                        CONF_font);
 
-              if (!strcmp(font->name, prev_font->name) ||
-                  !strcmp(conf_get_str(conf, CONF_line_codepage),
-                          conf_get_str(prev_conf, CONF_line_codepage)) ||
-                  font->isbold != prev_font->isbold ||
-                  font->height != prev_font->height ||
-                  font->charset != prev_font->charset ||
-                  conf_get_int(conf, CONF_font_quality) !=
-                  conf_get_int(prev_conf, CONF_font_quality) ||
-                  conf_get_int(conf, CONF_vtmode) !=
-                  conf_get_int(prev_conf, CONF_vtmode) ||
-                  conf_get_int(conf, CONF_bold_style) !=
-                  conf_get_int(prev_conf, CONF_bold_style) ||
-                  resize_action == RESIZE_DISABLED ||
-                  resize_action == RESIZE_EITHER ||
-                  resize_action != conf_get_int(prev_conf,
-                                                CONF_resize_action))
-                  init_lvl = 2;
+                if (!strcmp(font->name, prev_font->name) ||
+                    !strcmp(conf_get_str(conf, CONF_line_codepage),
+                            conf_get_str(prev_conf, CONF_line_codepage)) ||
+                    font->isbold != prev_font->isbold ||
+                    font->height != prev_font->height ||
+                    font->charset != prev_font->charset ||
+                    conf_get_int(conf, CONF_font_quality) !=
+                    conf_get_int(prev_conf, CONF_font_quality) ||
+                    conf_get_int(conf, CONF_vtmode) !=
+                    conf_get_int(prev_conf, CONF_vtmode) ||
+                    conf_get_int(conf, CONF_bold_style) !=
+                    conf_get_int(prev_conf, CONF_bold_style) ||
+                    resize_action == RESIZE_DISABLED ||
+                    resize_action == RESIZE_EITHER ||
+                    resize_action != conf_get_int(prev_conf,
+                                                  CONF_resize_action))
+                    init_lvl = 2;
             }
 
             InvalidateRect(hwnd, NULL, true);
@@ -2602,6 +2617,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
              (conf_get_int(conf, CONF_mouse_is_xterm) == 2))) {
             POINT cursorpos;
 
+            /* Just in case this happened in mid-select */
+            term_cancel_selection_drag(term);
+
             show_mouseptr(true);    /* make sure pointer is visible */
             GetCursorPos(&cursorpos);
             TrackPopupMenu(popup_menus[CTXMENU].menu,
@@ -2662,27 +2680,26 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
 
                 GetCursorPos(&pt);
 #ifndef NO_MULTIMON
-                {
+                if (p_GetMonitorInfoA && p_MonitorFromPoint) {
                     HMONITOR mon;
                     MONITORINFO mi;
 
-                    mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONULL);
+                    mon = p_MonitorFromPoint(pt, MONITOR_DEFAULTTONULL);
 
                     if (mon != NULL) {
                         mi.cbSize = sizeof(MONITORINFO);
-                        GetMonitorInfo(mon, &mi);
+                        p_GetMonitorInfoA(mon, &mi);
 
                         if (mi.rcMonitor.left == pt.x &&
                             mi.rcMonitor.top == pt.y) {
                             mouse_on_hotspot = true;
                         }
                     }
-                }
-#else
+                } else
+#endif
                 if (pt.x == 0 && pt.y == 0) {
                     mouse_on_hotspot = true;
                 }
-#endif
                 if (is_full_screen() && press &&
                     button == MBT_LEFT && mouse_on_hotspot) {
                     SendMessage(hwnd, WM_SYSCOMMAND, SC_MOUSEMENU,
@@ -2717,9 +2734,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
         static LPARAM lp = 0;
         if (wParam != wp || lParam != lp ||
             last_mousemove != WM_MOUSEMOVE) {
-          show_mouseptr(true);
-          wp = wParam; lp = lParam;
-          last_mousemove = WM_MOUSEMOVE;
+            show_mouseptr(true);
+            wp = wParam; lp = lParam;
+            last_mousemove = WM_MOUSEMOVE;
         }
         /*
          * Add the mouse position and message time to the random
@@ -2740,6 +2757,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
                        TO_CHR_X(X_POS(lParam)),
                        TO_CHR_Y(Y_POS(lParam)), wParam & MK_SHIFT,
                        wParam & MK_CONTROL, is_alt_pressed());
+        } else {
+            term_mouse(term, MBT_NOTHING, MBT_NOTHING, MA_MOVE,
+                       TO_CHR_X(X_POS(lParam)),
+                       TO_CHR_Y(Y_POS(lParam)), false,
+                       false, false);
         }
         return 0;
       }
@@ -2748,9 +2770,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
         static LPARAM lp = 0;
         if (wParam != wp || lParam != lp ||
             last_mousemove != WM_NCMOUSEMOVE) {
-          show_mouseptr(true);
-          wp = wParam; lp = lParam;
-          last_mousemove = WM_NCMOUSEMOVE;
+            show_mouseptr(true);
+            wp = wParam; lp = lParam;
+            last_mousemove = WM_NCMOUSEMOVE;
         }
         noise_ultralight(NOISE_SOURCE_MOUSEPOS, lParam);
         break;
@@ -2769,8 +2791,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
         HideCaret(hwnd);
         hdc = BeginPaint(hwnd, &p);
         if (pal) {
-          SelectPalette(hdc, pal, true);
-          RealizePalette(hdc);
+            SelectPalette(hdc, pal, true);
+            RealizePalette(hdc);
         }
 
         /*
@@ -2821,40 +2843,40 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
             p.rcPaint.right >= offset_width + font_width*term->cols ||
             p.rcPaint.bottom>= offset_height + font_height*term->rows)
         {
-          HBRUSH fillcolour, oldbrush;
-          HPEN   edge, oldpen;
-          fillcolour = CreateSolidBrush (
-              colours[ATTR_DEFBG>>ATTR_BGSHIFT]);
-          oldbrush = SelectObject(hdc, fillcolour);
-          edge = CreatePen(PS_SOLID, 0,
-                           colours[ATTR_DEFBG>>ATTR_BGSHIFT]);
-          oldpen = SelectObject(hdc, edge);
+            HBRUSH fillcolour, oldbrush;
+            HPEN   edge, oldpen;
+            fillcolour = CreateSolidBrush (
+                colours[ATTR_DEFBG>>ATTR_BGSHIFT]);
+            oldbrush = SelectObject(hdc, fillcolour);
+            edge = CreatePen(PS_SOLID, 0,
+                             colours[ATTR_DEFBG>>ATTR_BGSHIFT]);
+            oldpen = SelectObject(hdc, edge);
 
-          /*
-           * Jordan Russell reports that this apparently
-           * ineffectual IntersectClipRect() call masks a
-           * Windows NT/2K bug causing strange display
-           * problems when the PuTTY window is taller than
-           * the primary monitor. It seems harmless enough...
-           */
-          IntersectClipRect(hdc,
-                            p.rcPaint.left, p.rcPaint.top,
-                            p.rcPaint.right, p.rcPaint.bottom);
+            /*
+             * Jordan Russell reports that this apparently
+             * ineffectual IntersectClipRect() call masks a
+             * Windows NT/2K bug causing strange display
+             * problems when the PuTTY window is taller than
+             * the primary monitor. It seems harmless enough...
+             */
+            IntersectClipRect(hdc,
+                              p.rcPaint.left, p.rcPaint.top,
+                              p.rcPaint.right, p.rcPaint.bottom);
 
-          ExcludeClipRect(hdc,
-                          offset_width, offset_height,
-                          offset_width+font_width*term->cols,
-                          offset_height+font_height*term->rows);
+            ExcludeClipRect(hdc,
+                            offset_width, offset_height,
+                            offset_width+font_width*term->cols,
+                            offset_height+font_height*term->rows);
 
-          Rectangle(hdc, p.rcPaint.left, p.rcPaint.top,
-                    p.rcPaint.right, p.rcPaint.bottom);
+            Rectangle(hdc, p.rcPaint.left, p.rcPaint.top,
+                      p.rcPaint.right, p.rcPaint.bottom);
 
-          /* SelectClipRgn(hdc, NULL); */
+            /* SelectClipRgn(hdc, NULL); */
 
-          SelectObject(hdc, oldbrush);
-          DeleteObject(fillcolour);
-          SelectObject(hdc, oldpen);
-          DeleteObject(edge);
+            SelectObject(hdc, oldbrush);
+            DeleteObject(fillcolour);
+            SelectObject(hdc, oldpen);
+            DeleteObject(edge);
         }
         SelectObject(hdc, GetStockObject(SYSTEM_FONT));
         SelectObject(hdc, GetStockObject(WHITE_PEN));
@@ -2862,21 +2884,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
         ShowCaret(hwnd);
         return 0;
       }
-      case WM_NETEVENT: {
-        /*
-         * To protect against re-entrancy when Windows's recv()
-         * immediately triggers a new WSAAsyncSelect window
-         * message, we don't call select_result directly from this
-         * handler but instead wait until we're back out at the
-         * top level of the message loop.
-         */
-        struct wm_netevent_params *params =
-            snew(struct wm_netevent_params);
-        params->wParam = wParam;
-        params->lParam = lParam;
-        queue_toplevel_callback(wm_netevent_callback, params);
+      case WM_NETEVENT:
+        winselgui_response(wParam, lParam);
         return 0;
-      }
       case WM_SETFOCUS:
         term_set_focus(term, true);
         CreateCaret(hwnd, caretbm, font_width, font_height);
@@ -3038,11 +3048,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
                 term, r.right - r.left, r.bottom - r.top);
         }
         if (wParam == SIZE_MINIMIZED)
-            SetWindowText(hwnd,
-                          conf_get_bool(conf, CONF_win_name_always) ?
-                          window_name : icon_name);
+            sw_SetWindowText(hwnd,
+                             conf_get_bool(conf, CONF_win_name_always) ?
+                             window_name : icon_name);
         if (wParam == SIZE_RESTORED || wParam == SIZE_MAXIMIZED)
-            SetWindowText(hwnd, window_name);
+            sw_SetWindowText(hwnd, window_name);
         if (wParam == SIZE_RESTORED) {
             processed_resize = false;
             clear_full_screen();
@@ -3264,7 +3274,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
             } else {
                 len = TranslateKey(message, wParam, lParam, buf);
                 if (len == -1)
-                    return DefWindowProcW(hwnd, message, wParam, lParam);
+                    return sw_DefWindowProc(hwnd, message, wParam, lParam);
 
                 if (len != 0) {
                     /*
@@ -3309,33 +3319,33 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
         n = ImmGetCompositionStringW(hIMC, GCS_RESULTSTR, NULL, 0);
 
         if (n > 0) {
-          int i;
-          buff = snewn(n, char);
-          ImmGetCompositionStringW(hIMC, GCS_RESULTSTR, buff, n);
-          /*
-           * Jaeyoun Chung reports that Korean character
-           * input doesn't work correctly if we do a single
-           * term_keyinputw covering the whole of buff. So
-           * instead we send the characters one by one.
-           */
-          /* don't divide SURROGATE PAIR */
-          if (ldisc) {
-            for (i = 0; i < n; i += 2) {
-              WCHAR hs = *(unsigned short *)(buff+i);
-              if (IS_HIGH_SURROGATE(hs) && i+2 < n) {
-                WCHAR ls = *(unsigned short *)(buff+i+2);
-                if (IS_LOW_SURROGATE(ls)) {
-                  term_keyinputw(
-                      term, (unsigned short *)(buff+i), 2);
-                  i += 2;
-                  continue;
+            int i;
+            buff = snewn(n, char);
+            ImmGetCompositionStringW(hIMC, GCS_RESULTSTR, buff, n);
+            /*
+             * Jaeyoun Chung reports that Korean character
+             * input doesn't work correctly if we do a single
+             * term_keyinputw covering the whole of buff. So
+             * instead we send the characters one by one.
+             */
+            /* don't divide SURROGATE PAIR */
+            if (ldisc) {
+                for (i = 0; i < n; i += 2) {
+                    WCHAR hs = *(unsigned short *)(buff+i);
+                    if (IS_HIGH_SURROGATE(hs) && i+2 < n) {
+                        WCHAR ls = *(unsigned short *)(buff+i+2);
+                        if (IS_LOW_SURROGATE(ls)) {
+                            term_keyinputw(
+                                term, (unsigned short *)(buff+i), 2);
+                            i += 2;
+                            continue;
+                        }
+                    }
+                    term_keyinputw(
+                        term, (unsigned short *)(buff+i), 1);
                 }
-              }
-              term_keyinputw(
-                  term, (unsigned short *)(buff+i), 1);
             }
-          }
-          free(buff);
+            free(buff);
         }
         ImmReleaseContext(hwnd, hIMC);
         return 1;
@@ -3362,7 +3372,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
          * post the things to us as part of a macro manoeuvre,
          * we're ready to cope.
          */
-        {
+        if (unicode_window) {
             static wchar_t pending_surrogate = 0;
             wchar_t c = wParam;
 
@@ -3376,6 +3386,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
             } else if (!IS_SURROGATE(c)) {
                 term_keyinputw(term, &c, 1);
             }
+        } else {
+            char c = (unsigned char)wParam;
+            term_seen_key_event(term);
+            if (ldisc)
+                term_keyinput(term, CP_ACP, &c, 1);
         }
         return 0;
       case WM_SYSCOLORCHANGE:
@@ -3391,10 +3406,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
         process_clipdata((HGLOBAL)lParam, wParam);
         return 0;
       default:
-        if (message == wm_mousewheel || message == WM_MOUSEWHEEL) {
+        if (message == wm_mousewheel || message == WM_MOUSEWHEEL
+                                                || message == WM_MOUSEHWHEEL) {
             bool shift_pressed = false, control_pressed = false;
 
-            if (message == WM_MOUSEWHEEL) {
+            if (message == WM_MOUSEWHEEL || message == WM_MOUSEHWHEEL) {
                 wheel_accumulator += (short)HIWORD(wParam);
                 shift_pressed=LOWORD(wParam) & MK_SHIFT;
                 control_pressed=LOWORD(wParam) & MK_CONTROL;
@@ -3413,10 +3429,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
 
                 /* reduce amount for next time */
                 if (wheel_accumulator > 0) {
-                    b = MBT_WHEEL_UP;
+                    b = message == WM_MOUSEHWHEEL ? MBT_WHEEL_RIGHT : MBT_WHEEL_UP;
                     wheel_accumulator -= WHEEL_DELTA;
                 } else if (wheel_accumulator < 0) {
-                    b = MBT_WHEEL_DOWN;
+                    b =  message == WM_MOUSEHWHEEL ? MBT_WHEEL_LEFT : MBT_WHEEL_DOWN;
                     wheel_accumulator += WHEEL_DELTA;
                 } else
                     break;
@@ -3436,7 +3452,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
                                    TO_CHR_Y(p.y), shift_pressed,
                                    control_pressed, is_alt_pressed());
                     } /* else: not sure when this can fail */
-                } else {
+                } else if (message != WM_MOUSEHWHEEL) {
                     /* trigger a scroll */
                     term_scroll(term, 0,
                                 b == MBT_WHEEL_UP ?
@@ -3451,7 +3467,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
      * Any messages we don't process completely above are passed through to
      * DefWindowProc() for default processing.
      */
-    return DefWindowProcW(hwnd, message, wParam, lParam);
+    return sw_DefWindowProc(hwnd, message, wParam, lParam);
 }
 
 /*
@@ -3809,9 +3825,7 @@ static void do_text_internal(
                     MultiByteToWideChar(ucsdata.font_codepage, MB_USEGLYPHCHARS,
                                         dbcstext, 2, uni_buf+nlen, 1);
                     mptr++;
-                }
-                else
-                {
+                } else {
                     char dbcstext[1];
                     dbcstext[0] = text[mptr] & 0xFF;
                     MultiByteToWideChar(ucsdata.font_codepage, MB_USEGLYPHCHARS,
@@ -4119,6 +4133,9 @@ static void init_winfuncs(void)
     GET_WINDOWS_FUNCTION(user32_module, FlashWindowEx);
     GET_WINDOWS_FUNCTION(user32_module, ToUnicodeEx);
     GET_WINDOWS_FUNCTION_PP(winmm_module, PlaySound);
+    GET_WINDOWS_FUNCTION_NO_TYPECHECK(user32_module, GetMonitorInfoA);
+    GET_WINDOWS_FUNCTION_NO_TYPECHECK(user32_module, MonitorFromPoint);
+    GET_WINDOWS_FUNCTION_NO_TYPECHECK(user32_module, MonitorFromWindow);
     GET_WINDOWS_FUNCTION_NO_TYPECHECK(shcore_module, GetDpiForMonitor);
     GET_WINDOWS_FUNCTION_NO_TYPECHECK(user32_module, GetSystemMetricsForDpi);
     GET_WINDOWS_FUNCTION_NO_TYPECHECK(user32_module, AdjustWindowRectExForDpi);
@@ -4235,7 +4252,7 @@ static int TranslateKey(UINT message, WPARAM wParam, LPARAM lParam,
         }
 
 
-        /* Nastyness with NUMLock - Shift-NUMLock is left alone though */
+        /* Nastiness with NUMLock - Shift-NUMLock is left alone though */
         if ((funky_type == FUNKY_VT400 ||
              (funky_type <= FUNKY_LINUX && term->app_keypad_keys &&
               !no_applic_k))
@@ -4288,9 +4305,9 @@ static int TranslateKey(UINT message, WPARAM wParam, LPARAM lParam,
     }
 
     if (wParam == compose_keycode) {
-        if (compose_state == 0
-            && (HIWORD(lParam) & (KF_UP | KF_REPEAT)) == 0) compose_state =
-                1;
+        if (compose_state == 0 &&
+            (HIWORD(lParam) & (KF_UP | KF_REPEAT)) == 0)
+            compose_state = 1;
         else if (compose_state == 1 && (HIWORD(lParam) & KF_UP))
             compose_state = 2;
         else
@@ -4511,6 +4528,8 @@ static int TranslateKey(UINT message, WPARAM wParam, LPARAM lParam,
         }
 
         switch (wParam) {
+            bool consumed_alt;
+
           case VK_NUMPAD0: keypad_key = '0'; goto numeric_keypad;
           case VK_NUMPAD1: keypad_key = '1'; goto numeric_keypad;
           case VK_NUMPAD2: keypad_key = '2'; goto numeric_keypad;
@@ -4592,8 +4611,12 @@ static int TranslateKey(UINT message, WPARAM wParam, LPARAM lParam,
           case VK_F19: fkey_number = 19; goto numbered_function_key;
           case VK_F20: fkey_number = 20; goto numbered_function_key;
           numbered_function_key:
+            consumed_alt = false;
             p += format_function_key((char *)p, term, fkey_number,
-                                     shift_state & 1, shift_state & 2);
+                                     shift_state & 1, shift_state & 2,
+                                     left_alt, &consumed_alt);
+            if (consumed_alt)
+                left_alt = false; /* supersedes the usual prefixing of Esc */
             return p - output;
 
             SmallKeypadKey sk_key;
@@ -4608,7 +4631,11 @@ static int TranslateKey(UINT message, WPARAM wParam, LPARAM lParam,
             if (shift_state & 2)
                 break;
 
-            p += format_small_keypad_key((char *)p, term, sk_key);
+            p += format_small_keypad_key((char *)p, term, sk_key,
+                                         shift_state & 1, shift_state & 2,
+                                         left_alt, &consumed_alt);
+            if (consumed_alt)
+                left_alt = false; /* supersedes the usual prefixing of Esc */
             return p - output;
 
             char xkey;
@@ -4618,7 +4645,11 @@ static int TranslateKey(UINT message, WPARAM wParam, LPARAM lParam,
           case VK_LEFT: xkey = 'D'; goto arrow_key;
           case VK_CLEAR: xkey = 'G'; goto arrow_key; /* close enough */
           arrow_key:
-            p += format_arrow_key((char *)p, term, xkey, shift_state & 2);
+            consumed_alt = false;
+            p += format_arrow_key((char *)p, term, xkey, shift_state & 1,
+                                  shift_state & 2, left_alt, &consumed_alt);
+            if (consumed_alt)
+                left_alt = false; /* supersedes the usual prefixing of Esc */
             return p - output;
 
           case VK_RETURN:
@@ -4790,20 +4821,30 @@ static int TranslateKey(UINT message, WPARAM wParam, LPARAM lParam,
     return -1;
 }
 
-static void wintw_set_title(TermWin *tw, const char *title)
+static void wintw_set_title(TermWin *tw, const char *title, int codepage)
 {
+    wchar_t *new_window_name = dup_mb_to_wc(codepage, 0, title);
+    if (!wcscmp(new_window_name, window_name)) {
+        sfree(new_window_name);
+        return;
+    }
     sfree(window_name);
-    window_name = dupstr(title);
+    window_name = new_window_name;
     if (conf_get_bool(conf, CONF_win_name_always) || !IsIconic(wgs.term_hwnd))
-        SetWindowText(wgs.term_hwnd, title);
+        sw_SetWindowText(wgs.term_hwnd, window_name);
 }
 
-static void wintw_set_icon_title(TermWin *tw, const char *title)
+static void wintw_set_icon_title(TermWin *tw, const char *title, int codepage)
 {
+    wchar_t *new_icon_name = dup_mb_to_wc(codepage, 0, title);
+    if (!wcscmp(new_icon_name, icon_name)) {
+        sfree(new_icon_name);
+        return;
+    }
     sfree(icon_name);
-    icon_name = dupstr(title);
+    icon_name = new_icon_name;
     if (!conf_get_bool(conf, CONF_win_name_always) && IsIconic(wgs.term_hwnd))
-        SetWindowText(wgs.term_hwnd, title);
+        sw_SetWindowText(wgs.term_hwnd, icon_name);
 }
 
 static void wintw_set_scrollbar(TermWin *tw, int total, int start, int page)
@@ -5001,7 +5042,7 @@ static void wintw_clip_write(
         unsigned char *tdata = (unsigned char *)lock2;
         wchar_t *udata = (wchar_t *)lock;
         int uindex = 0, tindex = 0;
-        int multilen, blen, alen, totallen, i;
+        int multilen, blen, alen, i;
         char before[16], after[4];
         int fgcolour,  lastfgcolour  = -1;
         int bgcolour,  lastbgcolour  = -1;
@@ -5016,7 +5057,7 @@ static void wintw_clip_write(
 
         get_unitab(CP_ACP, unitab, 0);
 
-        strbuf_catf(
+        put_fmt(
             rtf, "{\\rtf1\\ansi\\deff0{\\fonttbl\\f0\\fmodern %s;}\\f0\\fs%d",
             font->name, font->height*2);
 
@@ -5104,16 +5145,16 @@ static void wintw_clip_write(
             for (i = 0; i < OSC4_NCOLOURS; i++) {
                 if (palette[i] != 0) {
                     const PALETTEENTRY *pe = &logpal->palPalEntry[i];
-                    strbuf_catf(rtf, "\\red%d\\green%d\\blue%d;",
-                                pe->peRed, pe->peGreen, pe->peBlue);
+                    put_fmt(rtf, "\\red%d\\green%d\\blue%d;",
+                            pe->peRed, pe->peGreen, pe->peBlue);
                 }
             }
             if (rgbtree) {
                 rgbindex *rgbp;
                 for (i = 0; (rgbp = index234(rgbtree, i)) != NULL; i++)
-                    strbuf_catf(rtf, "\\red%d\\green%d\\blue%d;",
-                                GetRValue(rgbp->ref), GetGValue(rgbp->ref),
-                                GetBValue(rgbp->ref));
+                    put_fmt(rtf, "\\red%d\\green%d\\blue%d;",
+                            GetRValue(rgbp->ref), GetGValue(rgbp->ref),
+                            GetBValue(rgbp->ref));
             }
             put_datapl(rtf, PTRLEN_LITERAL("}"));
         }
@@ -5232,13 +5273,13 @@ static void wintw_clip_write(
                     lastfgcolour  = fgcolour;
                     lastfg        = fg;
                     if (fg == -1) {
-                        strbuf_catf(rtf, "\\cf%d ",
-                                    (fgcolour >= 0) ? palette[fgcolour] : 0);
+                        put_fmt(rtf, "\\cf%d ",
+                                (fgcolour >= 0) ? palette[fgcolour] : 0);
                     } else {
                         rgbindex rgb, *rgbp;
                         rgb.ref = fg;
                         if ((rgbp = find234(rgbtree, &rgb, NULL)) != NULL)
-                            strbuf_catf(rtf, "\\cf%d ", rgbp->index);
+                            put_fmt(rtf, "\\cf%d ", rgbp->index);
                     }
                 }
 
@@ -5246,13 +5287,13 @@ static void wintw_clip_write(
                     lastbgcolour  = bgcolour;
                     lastbg        = bg;
                     if (bg == -1)
-                        strbuf_catf(rtf, "\\highlight%d ",
-                                    (bgcolour >= 0) ? palette[bgcolour] : 0);
+                        put_fmt(rtf, "\\highlight%d ",
+                                (bgcolour >= 0) ? palette[bgcolour] : 0);
                     else {
                         rgbindex rgb, *rgbp;
                         rgb.ref = bg;
                         if ((rgbp = find234(rgbtree, &rgb, NULL)) != NULL)
-                            strbuf_catf(rtf, "\\highlight%d ", rgbp->index);
+                            put_fmt(rtf, "\\highlight%d ", rgbp->index);
                     }
                 }
 
@@ -5289,19 +5330,6 @@ static void wintw_clip_write(
                 }
             }
             assert(tindex + multilen <= len2);
-            totallen = blen + alen;
-            for (i = 0; i < multilen; i++) {
-                if (tdata[tindex+i] == '\\' ||
-                    tdata[tindex+i] == '{' ||
-                    tdata[tindex+i] == '}')
-                    totallen += 2;
-                else if (tdata[tindex+i] == 0x0D || tdata[tindex+i] == 0x0A)
-                    totallen += 6;     /* \par\r\n */
-                else if (tdata[tindex+i] > 0x7E || tdata[tindex+i] < 0x20)
-                    totallen += 4;
-                else
-                    totallen++;
-            }
 
             put_data(rtf, before, blen);
             for (i = 0; i < multilen; i++) {
@@ -5313,7 +5341,7 @@ static void wintw_clip_write(
                 } else if (tdata[tindex+i] == 0x0D || tdata[tindex+i] == 0x0A) {
                     put_datapl(rtf, PTRLEN_LITERAL("\\par\r\n"));
                 } else if (tdata[tindex+i] > 0x7E || tdata[tindex+i] < 0x20) {
-                    strbuf_catf(rtf, "\\'%02x", tdata[tindex+i]);
+                    put_fmt(rtf, "\\'%02x", tdata[tindex+i]);
                 } else {
                     put_byte(rtf, tdata[tindex+i]);
                 }
@@ -5590,7 +5618,7 @@ static void wintw_bell(TermWin *tw, int mode)
     } else if (mode == BELL_WAVEFILE) {
         Filename *bell_wavefile = conf_get_filename(conf, CONF_bell_wavefile);
         if (!p_PlaySound || !p_PlaySound(bell_wavefile->path, NULL,
-                         SND_ASYNC | SND_FILENAME)) {
+                                         SND_ASYNC | SND_FILENAME)) {
             char *buf, *otherbuf;
             show_mouseptr(true);
             buf = dupprintf(
@@ -5651,7 +5679,7 @@ static void wintw_move(TermWin *tw, int x, int y)
     if (resize_action == RESIZE_DISABLED ||
         resize_action == RESIZE_FONT ||
         IsZoomed(wgs.term_hwnd))
-       return;
+        return;
 
     SetWindowPos(wgs.term_hwnd, NULL, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
 }
@@ -5706,26 +5734,27 @@ static bool is_full_screen()
 /* Get the rect/size of a full screen window using the nearest available
  * monitor in multimon systems; default to something sensible if only
  * one monitor is present. */
-static bool get_fullscreen_rect(RECT * ss)
+static bool get_fullscreen_rect(RECT *ss)
 {
 #if defined(MONITOR_DEFAULTTONEAREST) && !defined(NO_MULTIMON)
+    if (p_GetMonitorInfoA && p_MonitorFromWindow) {
         HMONITOR mon;
         MONITORINFO mi;
-        mon = MonitorFromWindow(wgs.term_hwnd, MONITOR_DEFAULTTONEAREST);
+        mon = p_MonitorFromWindow(wgs.term_hwnd, MONITOR_DEFAULTTONEAREST);
         mi.cbSize = sizeof(mi);
-        GetMonitorInfo(mon, &mi);
+        p_GetMonitorInfoA(mon, &mi);
 
         /* structure copy */
         *ss = mi.rcMonitor;
         return true;
-#else
+    }
+#endif
 /* could also use code like this:
         ss->left = ss->top = 0;
         ss->right = GetSystemMetrics(SM_CXSCREEN);
         ss->bottom = GetSystemMetrics(SM_CYSCREEN);
 */
-        return GetClientRect(GetDesktopWindow(), ss);
-#endif
+    return GetClientRect(GetDesktopWindow(), ss);
 }
 
 
@@ -5736,12 +5765,12 @@ static bool get_fullscreen_rect(RECT * ss)
 static void make_full_screen()
 {
     DWORD style;
-        RECT ss;
+    RECT ss;
 
     assert(IsZoomed(wgs.term_hwnd));
 
-        if (is_full_screen())
-                return;
+    if (is_full_screen())
+        return;
 
     /* Remove the window furniture. */
     style = GetWindowLongPtr(wgs.term_hwnd, GWL_STYLE);
@@ -5753,7 +5782,7 @@ static void make_full_screen()
     SetWindowLongPtr(wgs.term_hwnd, GWL_STYLE, style);
 
     /* Resize ourselves to exactly cover the nearest monitor. */
-        get_fullscreen_rect(&ss);
+    get_fullscreen_rect(&ss);
     SetWindowPos(wgs.term_hwnd, HWND_TOP, ss.left, ss.top,
                  ss.right - ss.left, ss.bottom - ss.top, SWP_FRAMECHANGED);
 
@@ -5817,10 +5846,16 @@ static void flip_full_screen()
     }
 }
 
-static size_t win_seat_output(Seat *seat, bool is_stderr,
+static size_t win_seat_output(Seat *seat, SeatOutputType type,
                               const void *data, size_t len)
 {
-    return term_data(term, is_stderr, data, len);
+    return term_data(term, data, len);
+}
+
+static void wintw_unthrottle(TermWin *win, size_t bufsize)
+{
+    if (backend)
+        backend_unthrottle(backend, bufsize);
 }
 
 static bool win_seat_eof(Seat *seat)
@@ -5828,19 +5863,22 @@ static bool win_seat_eof(Seat *seat)
     return true;   /* do respond to incoming EOF with outgoing */
 }
 
-static int win_seat_get_userpass_input(
-    Seat *seat, prompts_t *p, bufchain *input)
+static SeatPromptResult win_seat_get_userpass_input(Seat *seat, prompts_t *p)
 {
-    int ret;
-    ret = cmdline_get_passwd_input(p);
-    if (ret == -1)
-        ret = term_get_userpass_input(term, p, input);
-    return ret;
+    SeatPromptResult spr;
+    spr = cmdline_get_passwd_input(p, &cmdline_get_passwd_state, true);
+    if (spr.kind == SPRK_INCOMPLETE)
+        spr = term_get_userpass_input(term, p);
+    return spr;
 }
 
-static bool win_seat_set_trust_status(Seat *seat, bool trusted)
+static void win_seat_set_trust_status(Seat *seat, bool trusted)
 {
     term_set_trust_status(term, trusted);
+}
+
+static bool win_seat_can_set_trust_status(Seat *seat)
+{
     return true;
 }
 
