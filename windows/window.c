@@ -4353,7 +4353,7 @@ static int TranslateKey(UINT message, WPARAM wParam, LPARAM lParam,
     /* If a key is pressed and AltGr is not active */
     if (key_down && (keystate[VK_RMENU] & 0x80) == 0 && !compose_state) {
         /* Okay, prepare for most alts then ... */
-        if (left_alt && shift_state != 1 && !(wParam == VK_UP || wParam == VK_DOWN || wParam == VK_RIGHT || wParam == VK_LEFT))
+        if (left_alt)
             *p++ = '\033';
 
         /* Lets see if it's a pattern we know all about ... */
@@ -4467,14 +4467,6 @@ static int TranslateKey(UINT message, WPARAM wParam, LPARAM lParam,
             *p++ = (conf_get_bool(conf, CONF_bksp_is_delete) ? 0x08 : 0x7F);
             *p++ = 0;
             return -2;
-        }
-        if (wParam == VK_TAB && shift_state == 2) {     /* Ctrl-Tab */
-            p += sprintf((char *) p, "\x1B[27;5;9~");
-            return p - output;
-        }
-        if (wParam == VK_TAB && shift_state == 3) {     /* Ctrl-Shift-Tab */
-            p += sprintf((char *) p, "\x1B[27;6;9~");
-            return p - output;
         }
         if (wParam == VK_TAB && shift_state == 1) {     /* Shift tab */
             *p++ = 0x1B;
@@ -4626,7 +4618,7 @@ static int TranslateKey(UINT message, WPARAM wParam, LPARAM lParam,
           case VK_LEFT: xkey = 'D'; goto arrow_key;
           case VK_CLEAR: xkey = 'G'; goto arrow_key; /* close enough */
           arrow_key:
-            p += format_arrow_key((char *)p, term, xkey, shift_state, left_alt);
+            p += format_arrow_key((char *)p, term, xkey, shift_state & 2);
             return p - output;
 
           case VK_RETURN:
