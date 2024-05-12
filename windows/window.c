@@ -4370,7 +4370,7 @@ static int TranslateKey(UINT message, WPARAM wParam, LPARAM lParam,
     /* If a key is pressed and AltGr is not active */
     if (key_down && (keystate[VK_RMENU] & 0x80) == 0 && !compose_state) {
         /* Okay, prepare for most alts then ... */
-        if (left_alt)
+        if (left_alt && shift_state != 1 && !(wParam == VK_UP || wParam == VK_DOWN || wParam == VK_RIGHT || wParam == VK_LEFT))
             *p++ = '\033';
 
         /* Lets see if it's a pattern we know all about ... */
