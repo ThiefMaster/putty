@@ -160,10 +160,11 @@ you want an automated batch job to make use of PSCP or Plink, and the
 interactive host key prompt is hanging the batch process - then the
 right way to fix it is to add the correct host key to the Registry in
 advance, or if the Registry is not available, to use the \cw{\-hostkey}
-command-line option. That way, you retain the \e{important} feature of
-host key checking: the right key will be accepted and the wrong ones
-will not. Adding an option to turn host key checking off completely is
-the wrong solution and we will not do it.
+command-line option (see \k{using-cmdline-hostkey}). That way, you
+retain the \e{important} feature of host key checking: the right key
+will be accepted and the wrong ones will not. Adding an option to turn
+host key checking off completely is the wrong solution and we will not
+do it.
 
 If you have host keys available in the common \i\c{known_hosts} format,
 we have a script called
