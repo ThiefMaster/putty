@@ -182,7 +182,7 @@ def make_argword(arg, argtype, fnname, argindex, argname, to_preserve):
     if typename in {
             "hashalg", "macalg", "keyalg", "cipheralg",
             "dh_group", "ecdh_alg", "rsaorder", "primegenpolicy",
-            "argon2flavour", "fptype", "httpdigesthash"}:
+            "argon2flavour", "fptype", "httpdigesthash", "mlkem_params"}:
         arg = coerce_to_bytes(arg)
         if isinstance(arg, bytes) and b" " not in arg:
             dictkey = (typename, arg)
@@ -308,8 +308,8 @@ def _lex_testcrypt_header(header):
         # And then match a token
         '({})'.format('|'.join((
             # Punctuation
-            '\(',
-            '\)',
+            r'\(',
+            r'\)',
             ',',
             # Identifier
             '[A-Za-z_][A-Za-z0-9_]*',

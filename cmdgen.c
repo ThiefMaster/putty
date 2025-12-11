@@ -264,6 +264,8 @@ int main(int argc, char **argv)
     ppk_save_parameters params = ppk_save_default_parameters;
     FingerprintType fptype = SSH_FPTYPE_DEFAULT;
 
+    enable_dit();
+
     if (is_interactive())
         progress_fp = stderr;
 
@@ -718,10 +720,11 @@ int main(int argc, char **argv)
 
     /*
      * If run with at least one argument _but_ not the required
-     * ones, print the usage message and return failure.
+     * ones, fail with an error.
      */
     if (!infile && keytype == NOKEYGEN) {
-        usage(true);
+        fprintf(stderr, "puttygen: expected an input key file name, "
+                "or -t for a type of key to generate\n");
         RETURN(1);
     }
 

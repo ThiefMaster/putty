@@ -290,6 +290,12 @@ static void gtk_seat_connection_fatal(Seat *seat, const char *msg)
     queue_toplevel_callback(connection_fatal_callback, inst);
 }
 
+static void gtk_seat_nonfatal(Seat *seat, const char *msg)
+{
+    GtkFrontend *inst = container_of(seat, GtkFrontend, seat);
+    nonfatal_message_box(inst->window, msg);
+}
+
 /*
  * Default settings that are specific to pterm.
  */
@@ -298,7 +304,7 @@ FontSpec *platform_default_fontspec(const char *name)
     if (!strcmp(name, "Font"))
         return fontspec_new(DEFAULT_GTK_FONT);
     else
-        return fontspec_new("");
+        return fontspec_new_default();
 }
 
 Filename *platform_default_filename(const char *name)
@@ -405,8 +411,8 @@ StripCtrlChars *gtk_seat_stripctrl_new(
 static void gtk_seat_notify_remote_exit(Seat *seat);
 static void gtk_seat_update_specials_menu(Seat *seat);
 static void gtk_seat_set_busy_status(Seat *seat, BusyStatus status);
-static const char *gtk_seat_get_x_display(Seat *seat);
 #ifndef NOT_X_WINDOWS
+static const char *gtk_seat_get_x_display(Seat *seat);
 static bool gtk_seat_get_windowid(Seat *seat, long *id);
 #endif
 static void gtk_seat_set_trust_status(Seat *seat, bool trusted);
@@ -423,6 +429,7 @@ static const SeatVtable gtk_seat_vt = {
     .notify_remote_exit = gtk_seat_notify_remote_exit,
     .notify_remote_disconnect = nullseat_notify_remote_disconnect,
     .connection_fatal = gtk_seat_connection_fatal,
+    .nonfatal = gtk_seat_nonfatal,
     .update_specials_menu = gtk_seat_update_specials_menu,
     .get_ttymode = gtk_seat_get_ttymode,
     .set_busy_status = gtk_seat_set_busy_status,
@@ -432,10 +439,11 @@ static const SeatVtable gtk_seat_vt = {
     .prompt_descriptions = gtk_seat_prompt_descriptions,
     .is_utf8 = gtk_seat_is_utf8,
     .echoedit_update = nullseat_echoedit_update,
-    .get_x_display = gtk_seat_get_x_display,
 #ifdef NOT_X_WINDOWS
+    .get_x_display = nullseat_get_x_display,
     .get_windowid = nullseat_get_windowid,
 #else
+    .get_x_display = gtk_seat_get_x_display,
     .get_windowid = gtk_seat_get_windowid,
 #endif
     .get_window_pixel_size = gtk_seat_get_window_pixel_size,
@@ -1596,10 +1604,12 @@ gint key_event(GtkWidget *widget, GdkEventKey *event, gpointer data)
             const wchar_t *wp;
             int wlen;
             int ulen;
+            buffer_sink bs[1];
 
-            wlen = mb_to_wc(DEFAULT_CODEPAGE, 0,
-                            event_string, strlen(event_string),
-                            widedata, lenof(widedata)-1);
+            buffer_sink_init(bs, widedata, sizeof(widedata) - sizeof(wchar_t));
+            put_mb_to_wc(bs, DEFAULT_CODEPAGE,
+                         event_string, strlen(event_string));
+            wlen = (wchar_t *)bs->out - widedata;
 
 #ifdef KEY_EVENT_DIAGNOSTICS
             {
@@ -1918,6 +1928,7 @@ gint key_event(GtkWidget *widget, GdkEventKey *event, gpointer data)
             if (event->state & GDK_CONTROL_MASK)
                 break;
 
+            consumed_meta_key = false;
             end = 1 + format_small_keypad_key(
                 output+1, inst->term, sk_key, event->state & GDK_SHIFT_MASK,
                 event->state & GDK_CONTROL_MASK,
@@ -2537,13 +2548,13 @@ static void gtkwin_set_raw_mouse_mode_pointer(TermWin *tw, bool activate)
 static void compute_whole_window_size(GtkFrontend *inst,
                                       int wchars, int hchars,
                                       int *wpix, int *hpix);
-#endif
 
 static void gtkwin_deny_term_resize(void *vctx)
 {
     GtkFrontend *inst = (GtkFrontend *)vctx;
     drawing_area_setup_simple(inst);
 }
+#endif
 
 static void gtkwin_timer(void *vctx, unsigned long now)
 {
@@ -2947,16 +2958,12 @@ static void clipboard_text_received(GtkClipboard *clipboard,
 {
     GtkFrontend *inst = (GtkFrontend *)data;
     wchar_t *paste;
-    int paste_len;
-    int length;
+    size_t paste_len;
 
     if (!text)
         return;
 
-    length = strlen(text);
-
-    paste = snewn(length, wchar_t);
-    paste_len = mb_to_wc(CS_UTF8, 0, text, length, paste, length);
+    paste = dup_mb_to_wc(CS_UTF8, text, length, &paste_len);
 
     term_do_paste(inst->term, paste, paste_len);
 
@@ -3095,17 +3102,15 @@ static void gtkwin_clip_write(
         state->pasteout_data_ctext_len = 0;
     }
 
-    state->pasteout_data = snewn(len*6, char);
-    state->pasteout_data_len = len*6;
-    state->pasteout_data_len = wc_to_mb(inst->ucsdata.line_codepage, 0,
-                                        data, len, state->pasteout_data,
-                                        state->pasteout_data_len, NULL);
-    if (state->pasteout_data_len == 0) {
-        sfree(state->pasteout_data);
-        state->pasteout_data = NULL;
-    } else {
-        state->pasteout_data =
-            sresize(state->pasteout_data, state->pasteout_data_len, char);
+    {
+        size_t outlen;
+        state->pasteout_data = dup_wc_to_mb_c(
+            inst->ucsdata.line_codepage, data, len, "", &outlen);
+        /* We can't handle pastes larger than INT_MAX, because
+         * gtk_selection_data_set_text's length parameter is a gint */
+        if (outlen > INT_MAX)
+            outlen = INT_MAX;
+        state->pasteout_data_len = outlen;
     }
 
 #ifndef NOT_X_WINDOWS
@@ -3233,7 +3238,7 @@ static void selection_received(GtkWidget *widget, GtkSelectionData *seldata,
     const guchar *seldata_data = gtk_selection_data_get_data(seldata);
     gint seldata_length = gtk_selection_data_get_length(seldata);
     wchar_t *paste;
-    int paste_len;
+    size_t paste_len;
     struct clipboard_state *state = clipboard_from_atom(
         inst, gtk_selection_data_get_selection(seldata));
 
@@ -3326,11 +3331,8 @@ static void selection_received(GtkWidget *widget, GtkSelectionData *seldata,
         }
     }
 
-    paste = snewn(length, wchar_t);
-    paste_len = mb_to_wc(charset, 0, text, length, paste, length);
-
+    paste = dup_mb_to_wc_c(charset, text, length, &paste_len);
     term_do_paste(inst->term, paste, paste_len);
-
     sfree(paste);
 
 #ifndef NOT_X_WINDOWS
@@ -3433,7 +3435,7 @@ static void gtkwin_set_title(TermWin *tw, const char *title, int codepage)
     GtkFrontend *inst = container_of(tw, GtkFrontend, termwin);
     sfree(inst->wintitle);
     if (codepage != CP_UTF8) {
-        wchar_t *title_w = dup_mb_to_wc(codepage, 0, title);
+        wchar_t *title_w = dup_mb_to_wc(codepage, title);
         inst->wintitle = encode_wide_string_as_utf8(title_w);
         sfree(title_w);
     } else {
@@ -3447,7 +3449,7 @@ static void gtkwin_set_icon_title(TermWin *tw, const char *title, int codepage)
     GtkFrontend *inst = container_of(tw, GtkFrontend, termwin);
     sfree(inst->icontitle);
     if (codepage != CP_UTF8) {
-        wchar_t *title_w = dup_mb_to_wc(codepage, 0, title);
+        wchar_t *title_w = dup_mb_to_wc(codepage, title);
         inst->icontitle = encode_wide_string_as_utf8(title_w);
         sfree(title_w);
     } else {
@@ -3889,11 +3891,11 @@ static void do_text_internal(
         truecolour.fg = truecolour.bg;
         truecolour.bg = trgb;
     }
-    if ((inst->bold_style & 2) && (attr & ATTR_BOLD)) {
+    if ((inst->bold_style & BOLD_STYLE_COLOUR) && (attr & ATTR_BOLD)) {
         if (nfg < 16) nfg |= 8;
         else if (nfg >= 256) nfg |= 1;
     }
-    if ((inst->bold_style & 2) && (attr & ATTR_BLINK)) {
+    if ((inst->bold_style & BOLD_STYLE_COLOUR) && (attr & ATTR_BLINK)) {
         if (nbg < 16) nbg |= 8;
         else if (nbg >= 256) nbg |= 1;
     }
@@ -3913,7 +3915,7 @@ static void do_text_internal(
         widefactor = 1;
     }
 
-    if ((attr & ATTR_BOLD) && (inst->bold_style & 1)) {
+    if ((attr & ATTR_BOLD) && (inst->bold_style & BOLD_STYLE_FONT)) {
         bold = true;
         fontid |= 1;
     } else {
@@ -4068,7 +4070,7 @@ static void gtkwin_draw_cursor(
         passive = true;
     } else
         passive = false;
-    if ((attr & TATTR_ACTCURS) && inst->cursor_type != 0) {
+    if ((attr & TATTR_ACTCURS) && inst->cursor_type != CURSOR_BLOCK) {
         attr &= ~TATTR_ACTCURS;
         active = true;
     } else
@@ -4093,7 +4095,7 @@ static void gtkwin_draw_cursor(
         len *= 2;
     }
 
-    if (inst->cursor_type == 0) {
+    if (inst->cursor_type == CURSOR_BLOCK) {
         /*
          * An active block cursor will already have been done by
          * the above do_text call, so we only need to do anything
@@ -4118,7 +4120,7 @@ static void gtkwin_draw_cursor(
         else
             char_width = inst->font_width;
 
-        if (inst->cursor_type == 1) {
+        if (inst->cursor_type == CURSOR_UNDERLINE) {
             uheight = inst->fonts[0]->ascent + 1;
             if (uheight >= inst->font_height)
                 uheight = inst->font_height - 1;
@@ -4128,7 +4130,7 @@ static void gtkwin_draw_cursor(
             dx = 1;
             dy = 0;
             length = len * widefactor * char_width;
-        } else {
+        } else /* inst->cursor_type == CURSOR_VERTICAL_LINE */ {
             int xadjust = 0;
             if (attr & TATTR_RIGHTCURS)
                 xadjust = char_width - 1;
@@ -4347,12 +4349,14 @@ void modalfatalbox(const char *p, ...)
     exit(1);
 }
 
+#ifndef NOT_X_WINDOWS
 static const char *gtk_seat_get_x_display(Seat *seat)
 {
-    return gdk_get_display();
+    if (GDK_IS_X11_DISPLAY(gdk_display_get_default()))
+        return gdk_get_display();
+    return NULL;
 }
 
-#ifndef NOT_X_WINDOWS
 static bool gtk_seat_get_windowid(Seat *seat, long *id)
 {
     GtkFrontend *inst = container_of(seat, GtkFrontend, seat);
@@ -4364,22 +4368,22 @@ static bool gtk_seat_get_windowid(Seat *seat, long *id)
 }
 #endif
 
-char *setup_fonts_ucs(GtkFrontend *inst)
+char *setup_fonts_ucs(GtkFrontend *inst, Conf *conf)
 {
-    bool shadowbold = conf_get_bool(inst->conf, CONF_shadowbold);
-    int shadowboldoffset = conf_get_int(inst->conf, CONF_shadowboldoffset);
+    bool shadowbold = conf_get_bool(conf, CONF_shadowbold);
+    int shadowboldoffset = conf_get_int(conf, CONF_shadowboldoffset);
     FontSpec *fs;
     unifont *fonts[4];
     int i;
 
-    fs = conf_get_fontspec(inst->conf, CONF_font);
+    fs = conf_get_fontspec(conf, CONF_font);
     fonts[0] = multifont_create(inst->area, fs->name, false, false,
                                 shadowboldoffset, shadowbold);
     if (!fonts[0]) {
         return dupprintf("unable to load font \"%s\"", fs->name);
     }
 
-    fs = conf_get_fontspec(inst->conf, CONF_boldfont);
+    fs = conf_get_fontspec(conf, CONF_boldfont);
     if (shadowbold || !fs->name[0]) {
         fonts[1] = NULL;
     } else {
@@ -4392,7 +4396,7 @@ char *setup_fonts_ucs(GtkFrontend *inst)
         }
     }
 
-    fs = conf_get_fontspec(inst->conf, CONF_widefont);
+    fs = conf_get_fontspec(conf, CONF_widefont);
     if (fs->name[0]) {
         fonts[2] = multifont_create(inst->area, fs->name, true, false,
                                     shadowboldoffset, shadowbold);
@@ -4406,7 +4410,7 @@ char *setup_fonts_ucs(GtkFrontend *inst)
         fonts[2] = NULL;
     }
 
-    fs = conf_get_fontspec(inst->conf, CONF_wideboldfont);
+    fs = conf_get_fontspec(conf, CONF_wideboldfont);
     if (shadowbold || !fs->name[0]) {
         fonts[3] = NULL;
     } else {
@@ -4857,7 +4861,7 @@ static void after_change_settings_dialog(void *vctx, int retval)
             conf_get_bool(newconf, CONF_shadowbold) ||
             conf_get_int(oldconf, CONF_shadowboldoffset) !=
             conf_get_int(newconf, CONF_shadowboldoffset)) {
-            char *errmsg = setup_fonts_ucs(inst);
+            char *errmsg = setup_fonts_ucs(inst, inst->conf);
             if (errmsg) {
                 char *msgboxtext =
                     dupprintf("Could not change fonts in terminal window: %s\n",
@@ -4946,7 +4950,7 @@ static void change_font_size(GtkFrontend *inst, int increment)
         }
     }
 
-    errmsg = setup_fonts_ucs(inst);
+    errmsg = setup_fonts_ucs(inst, inst->conf);
     if (errmsg)
         goto cleanup;
 
@@ -5346,15 +5350,48 @@ void new_session_window(Conf *conf, const char *geometry_string)
     inst->area = gtk_drawing_area_new();
     gtk_widget_set_name(GTK_WIDGET(inst->area), "drawing-area");
 
+    /*
+     * Try to create the fonts for use in the window. If this fails,
+     * we'll try again with some fallback settings, and only abort
+     * completely if we can't find any fonts at all.
+     */
     {
-        char *errmsg = setup_fonts_ucs(inst);
-        if (errmsg) {
-            window_setup_error(errmsg);
-            sfree(errmsg);
-            gtk_widget_destroy(inst->area);
-            sfree(inst);
-            return;
+        char *errmsg_main = setup_fonts_ucs(inst, inst->conf);
+        if (!errmsg_main)
+            goto fonts_ok;
+
+        static const char *const fallbacks[] = {
+            DEFAULT_GTK_CLIENT_FONT,
+            DEFAULT_GTK_SERVER_FONT,
+        };
+        for (size_t i = 0; i < lenof(fallbacks); i++) {
+            Conf *fallback_conf = conf_new();
+            do_defaults(NULL, fallback_conf);
+
+            FontSpec *fs = fontspec_new(fallbacks[i]);
+            conf_set_fontspec(fallback_conf, CONF_font, fs);
+            fontspec_free(fs);
+
+            char *errmsg_fallback = setup_fonts_ucs(inst, fallback_conf);
+            conf_free(fallback_conf);
+
+            if (!errmsg_fallback) {
+                fprintf(stderr, "%s; falling back to default font '%s'\n",
+                        errmsg_main, fallbacks[i]);
+                sfree(errmsg_main);
+                goto fonts_ok;
+            }
+
+            sfree(errmsg_fallback);
         }
+
+        window_setup_error(errmsg_main);
+        sfree(errmsg_main);
+        gtk_widget_destroy(inst->area);
+        sfree(inst);
+        return;
+
+      fonts_ok:;
     }
 
 #if GTK_CHECK_VERSION(2,0,0)

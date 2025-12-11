@@ -78,7 +78,9 @@ https://wiki.gnome.org/Projects/GTK%2B/OSX/Bundling has some links.
 #define MAY_REFER_TO_GTK_IN_HEADERS
 
 #include "putty.h"
+#include "ssh.h"
 #include "gtkmisc.h"
+#include "gtkcompat.h"
 
 char *x_get_default(const char *key) { return NULL; }
 
@@ -293,6 +295,8 @@ int main(int argc, char **argv)
 {
     int status;
 
+    enable_dit();
+
     /* Call the function in ux{putty,pterm}.c to do app-type
      * specific setup */
     setup(false);     /* false means we are not a one-session process */
@@ -311,7 +315,7 @@ int main(int argc, char **argv)
     gtkcomm_setup();
 
     app = gtk_application_new("org.tartarus.projects.putty.macputty",
-                              G_APPLICATION_FLAGS_NONE);
+                              G_APPLICATION_DEFAULT_FLAGS);
     g_signal_connect(app, "activate", G_CALLBACK(activate), NULL);
     g_signal_connect(app, "startup", G_CALLBACK(startup), NULL);
     g_action_map_add_action_entries(G_ACTION_MAP(app),

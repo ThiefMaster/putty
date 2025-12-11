@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.7)
+cmake_minimum_required(VERSION 3.7...3.28)
 project(putty-documentation LANGUAGES)
 
 # This build script can be run standalone, or included as a
@@ -82,6 +82,7 @@ if(HALIBUT AND PERL_EXECUTABLE)
     ${CMAKE_CURRENT_SOURCE_DIR}/pgpkeys.but
     ${CMAKE_CURRENT_SOURCE_DIR}/sshnames.but
     ${CMAKE_CURRENT_SOURCE_DIR}/authplugin.but
+    ${CMAKE_CURRENT_SOURCE_DIR}/privacy.but
     ${CMAKE_CURRENT_SOURCE_DIR}/index.but
     ${VERSION_BUT})
 

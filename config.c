@@ -122,11 +122,19 @@ void conf_editbox_handler(dlgcontrol *ctrl, dlgparam *dlg,
 
     if (type->type == EDIT_STR) {
         if (event == EVENT_REFRESH) {
-            char *field = conf_get_str(conf, key);
-            dlg_editbox_set(ctrl, dlg, field);
+            bool utf8;
+            char *field = conf_get_str_ambi(conf, key, &utf8);
+            if (utf8)
+                dlg_editbox_set_utf8(ctrl, dlg, field);
+            else
+                dlg_editbox_set(ctrl, dlg, field);
         } else if (event == EVENT_VALCHANGE) {
-            char *field = dlg_editbox_get(ctrl, dlg);
-            conf_set_str(conf, key, field);
+            char *field = dlg_editbox_get_utf8(ctrl, dlg);
+            if (!conf_try_set_utf8(conf, key, field)) {
+                sfree(field);
+                field = dlg_editbox_get(ctrl, dlg);
+                conf_set_str(conf, key, field);
+            }
             sfree(field);
         }
     } else {
@@ -570,6 +578,8 @@ static void kexlist_handler(dlgcontrol *ctrl, dlgparam *dlg,
             { "RSA-based key exchange",             KEX_RSA },
             { "ECDH key exchange",                  KEX_ECDH },
             { "NTRU Prime / Curve25519 hybrid kex", KEX_NTRU_HYBRID },
+            { "ML-KEM / Curve25519 hybrid kex",     KEX_MLKEM_25519_HYBRID },
+            { "ML-KEM / NIST ECDH hybrid kex",      KEX_MLKEM_NIST_HYBRID },
             { "-- warn below here --",              KEX_WARN }
         };
 
@@ -1977,7 +1987,7 @@ void setup_config_box(struct controlbox *b, bool midsession,
                           sshrawlogname, 'r', I(LGTYP_SSHRAW));
     }
     ctrl_filesel(s, "Log file name:", 'f',
-                 NULL, true, "Select session log file name",
+                 FILTER_ALL_FILES, true, "Select session log file name",
                  HELPCTX(logging_filename),
                  conf_filesel_handler, I(CONF_logfilename));
     ctrl_text(s, "(Log file name can contain &Y, &M, &D for date,"
@@ -2190,6 +2200,9 @@ void setup_config_box(struct controlbox *b, bool midsession,
     ctrl_checkbox(s, "Disable bidirectional text display",
                   'd', HELPCTX(features_bidi), conf_checkbox_handler,
                   I(CONF_no_bidi));
+    ctrl_checkbox(s, "Disable bracketed paste mode",
+                  'p', HELPCTX(features_bracketed_paste), conf_checkbox_handler,
+                  I(CONF_no_bracketed_paste));
 
     /*
      * The Window panel.
@@ -2248,9 +2261,9 @@ void setup_config_box(struct controlbox *b, bool midsession,
                       HELPCTX(appearance_cursor),
                       conf_radiobutton_handler,
                       I(CONF_cursor_type),
-                      "Block", 'l', I(0),
-                      "Underline", 'u', I(1),
-                      "Vertical line", 'v', I(2));
+                      "Block", 'l', I(CURSOR_BLOCK),
+                      "Underline", 'u', I(CURSOR_UNDERLINE),
+                      "Vertical line", 'v', I(CURSOR_VERTICAL_LINE));
     ctrl_checkbox(s, "Cursor blinks", 'b',
                   HELPCTX(appearance_cursor),
                   conf_checkbox_handler, I(CONF_blink_cur));
@@ -2420,9 +2433,9 @@ void setup_config_box(struct controlbox *b, bool midsession,
     ctrl_radiobuttons(s, "Indicate bolded text by changing:", 'b', 3,
                       HELPCTX(colours_bold),
                       conf_radiobutton_handler, I(CONF_bold_style),
-                      "The font", I(1),
-                      "The colour", I(2),
-                      "Both", I(3));
+                      "The font", I(BOLD_STYLE_FONT),
+                      "The colour", I(BOLD_STYLE_COLOUR),
+                      "Both", I(BOLD_STYLE_FONT | BOLD_STYLE_COLOUR));
 
     str = dupprintf("Adjust the precise colours %s displays", appname);
     s = ctrl_getset(b, "Window/Colours", "adjust", str);
@@ -2736,7 +2749,7 @@ void setup_config_box(struct controlbox *b, bool midsession,
             c = ctrl_draglist(s, "Algorithm selection policy:", 's',
                               HELPCTX(ssh_kexlist),
                               kexlist_handler, P(NULL));
-            c->listbox.height = KEX_MAX;
+            c->listbox.height = 10;
 #ifndef NO_GSSAPI
             ctrl_checkbox(s, "Attempt GSSAPI key exchange",
                           'k', HELPCTX(ssh_gssapi),
@@ -2919,7 +2932,7 @@ void setup_config_box(struct controlbox *b, bool midsession,
                          conf_filesel_handler, I(CONF_keyfile));
             ctrl_filesel(s, "Certificate to use with the private key "
                          "(optional):", 'e',
-                         NULL, false, "Select certificate file",
+                         FILTER_ALL_FILES, false, "Select certificate file",
                          HELPCTX(ssh_auth_cert),
                          conf_filesel_handler, I(CONF_detached_cert));
 
